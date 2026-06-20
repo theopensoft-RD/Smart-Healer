@@ -1,72 +1,101 @@
-# fleet-healer — Node-Local Self-Healing Agent
+# fleet-healer
 
-> A guardrailed, **node-local self-healing agent** for an edge sensor fleet (RPi-class nodes running radar/Modbus + camera + MQTT workers). It detects and remediates recurring **in-node software/config faults**, and **escalates** the rest (hardware/physical) to the operator's existing monitoring/alerting.
+A guardrailed, **node-local self-healing agent** for an edge sensor fleet (RPi-class
+nodes running radar/Modbus + camera + MQTT workers). It detects and remediates
+recurring **in-node software/config faults**, escalates the rest (hardware/physical),
+and emits a **compact structured event stream designed for AI-assisted diagnosis**.
 
----
+Deployed as a single zipapp artifact (`healer.pyz`) driven by a `systemd` oneshot
+timer (~60 s). Python standard library only — no third-party runtime deps.
 
-## 1. Background
+## Why
 
-An edge fleet of sensor nodes hits the same failures over and over — Modbus radar circuit stuck, stream/camera config drift, redis crash, service crash-loops, disk fill — each historically fixed **by hand over SSH** (tribal knowledge / key-person dependency). `fleet-healer` automates that: nodes self-recover the recurring software/config faults under hard guardrails, and escalate the hardware/physical ones so a human only gets involved when a human is actually required.
+Edge fleets hit the same failures over and over — a Modbus radar circuit stuck, a
+stream/camera config drift, a stale media-server broadcast after a restart, redis
+down, a service crash-loop, disk fill — each historically fixed **by hand over SSH**
+(tribal knowledge / key-person dependency). `fleet-healer` automates that under hard
+guardrails, and turns every action into a structured event an operator (or an
+external AI agent) can analyse.
 
-## 2. Architecture
+## Architecture (modular)
 
-- **Graduated · least-invasive-first (L0→L5):** L0 in-process fix → L1 service restart → L2 dependency restart → L3 config repair → L4 link recovery → L5 reboot (**performed by an edge hardware watchdog, NOT this agent**) → escalate.
-- **Runtime:** a `systemd` oneshot timer (~60 s) that re-reads the agent each tick.
-- **10 guardrails (hard-won):** self-preservation (never reboots itself; never touches the overlay network) · startup-grace · rate-limit→escalate · backup-before-edit · identity-gate · no-fake · idempotent · liveness ≠ workload-metric · verify-after-act · network-safe.
+```
+pat_fleet_healer/
+├── config.py            all tunables + .env loading (one place)
+├── context.py           Context = config + injected services (DI -> unit-testable)
+├── core/                side-effect chokepoints: shell · systemd · net · journal ·
+│                        state · events · log · escalate
+├── healers/             one module per failure-family; Healer.run(ctx)
+│   └── registry.py      ordered registry (dependency-first)
+├── runner.py            the engine: build ctx, run registry, per-healer isolation
+├── events_schema.py     the event manifest (decoder + cause/fix playbook)
+└── tools/collect.py     build an AI diagnostic bundle
+build.py                 -> healer.pyz (zipapp single artifact)
+tests/                   56 unit tests (each healer isolated via a stub Context)
+```
 
-## 3. Version history
+- **Graduated, least-invasive-first (L0→L5):** in-process fix → service restart →
+  dependency restart → config repair → link recovery → reboot (an **edge watchdog**,
+  *not* this agent) → escalate.
+- **Guardrails (hard-won):** self-preservation (never reboots itself; never touches
+  the overlay network) · startup-grace · rate-limit→escalate · backup-before-edit ·
+  identity-gate · verify-after-act · liveness ≠ workload-metric.
+- **Dependency injection:** healers receive a `Context` and call `ctx.<service>(...)`,
+  so every healer is unit-tested in isolation with stub services — no global
+  monkeypatching, no live side effects.
 
-| version | milestone |
-|---|---|
-| 0.1 | Design — FMEA failure-mode catalog + framework spec; graduated ladder + guardrails |
-| 0.2 | **P0 root fix** — Modbus radar circuit-breaker half-open (kills the #1 recurring fault in-process); first single-node trial |
-| 0.3 | Node-local agent (5 healers: dependency, service-liveness, radar-sensor, stream-camera, connectivity) + systemd timer + narrow NOPASSWD sudoers |
-| 0.4 | MQTT escalation; full test suite (unit + live induced-fault); second node |
-| 0.5 | +`disk-hygiene` healer (log/backup rotation) |
-| 0.6 | +monitoring-agent healer · +sensor-relocation escalation · env-var bugfix · **7 healers · 22 unit tests** · env-path test hook |
-| 0.6 (rollout) | Fleet-wide deploy — agent-only, idempotent, no stream restart |
+## Structured events for AI diagnosis
 
-## 4. Coverage
+Every action/escalation is one compact JSONL atom — `{t, n, e, d?}` (epoch, node,
+**code**, optional fields). Severity / description / **likely-cause / suggested-fix**
+live once in the manifest (`events_schema.py`), not on every line. An external AI
+agent reads the manifest and can decode + reason about every event with no prior
+knowledge of the system.
 
-### ✅ Auto-healed (node-local)
-| Failure mode | Detection (read-only) | Action |
-|---|---|---|
-| radar circuit stuck-open | radar FAULT · `circuit=open` · no recent ONLINE | L0 in-proc half-open + L1 restart |
-| stream / camera config | stream not pushing · LAN `:554` scan · journal | L3 — re-point camera IP · force H.264 · quote config value · restart |
-| service crash / inactive | `systemctl is-active` (+ startup-grace) | L1 reset-failed + restart |
-| redis dependency down | redis ping | L2 restart redis + dependents |
-| disk / log growth | strict pattern + mtime | purge rotated logs/backups past retention |
-| monitoring-agent stopped | service inactive (unit present) | L1 restart |
+```json
+{"t":1718900837,"n":"NODE-01","e":"stream-republish.republish-no-rtmp-after-restart","d":{"ams":"media-01"}}
+```
 
-### 🟡 Escalate-only (cannot auto-fix → operator alerting → technician)
-sensor hardware dead · camera absent · **sensor relocated / re-addressed** (scan, escalate a *candidate* — deliberately **not** auto-repointed: pointing at the wrong Modbus device = wrong reading = safety-critical) · backend ID placeholder · ingest/census mismatch · WAN down (+ router self-reboot) · node hardware-dead (no out-of-band on cellular CGNAT → on-site).
+Compaction: codes not prose · severity from the manifest (not per line) · heartbeat
+not every tick · gzip-rotate at rest. ~70-100 B/atom raw, ~10-15× under gzip.
+`healer.pyz collect` packages the manifest + recent events + a live state snapshot
+into one gzip'd, secret-redacted bundle for the agent.
 
-### 🔵 Handled elsewhere (not this agent)
-- **thermal / transcode** → deploy-time encoder config (the agent forces the camera to H.264 to reduce transcode, but does not set the encoder mode itself)
-- **node software-hang** → `systemd` RuntimeWatchdog (edge)
-- **human alerting** → the operator's existing dashboard + chat alerting (the agent's `escalate()` is a supplementary MQTT/log channel)
+## Coverage
 
-## 5. What it does NOT cover (honest gaps)
+**Auto-healed (node-local):** radar circuit stuck-open · stream/camera config drift
+(re-point IP, force H.264) · **stale media-server broadcast after a restart** (clean
+re-publish, fleet-staggered) · service crash · redis down · disk hygiene ·
+monitoring-agent stopped.
 
-| Gap | Why |
-|---|---|
-| monitoring-agent **blindness** beyond "stopped service" | the healer only restarts a *stopped* agent service; nodes with **no agent installed** (need install) or an agent that **cannot reach the hub** (network-degraded) are not auto-fixed |
-| **overlay-network version / proxy degradation** | nodes on an older overlay-SSH proxy intermittently lose admin SSH + monitoring reachability; the connectivity healer only checks WAN ping, not overlay/hub reach |
-| **camera connection flap / down** | root cause is **physical** — water ingress in the camera PoE connector, or mechanical strain on the LAN cable → connection flap/loss; the agent escalates but cannot repair (needs on-site re-seat/waterproof + strain-relief) |
+**Escalate-only (needs a human):** sensor hardware dead · sensor relocated/re-addressed
+(a candidate is reported, **never auto-repointed** — wrong device = wrong reading) ·
+camera absent · WAN down · physical faults (connector water-ingress, cable strain).
 
-## 6. Deploy & test
+**Honest gaps (not node-local):** monitoring blindness when no agent is installed ·
+overlay-network proxy degradation · cross-layer faults that need a **central
+reconciler** (server-side) rather than a node agent.
 
-- **Deploy** (agent-only, no stream restart): backup → `py_compile`-gated → idempotent sudoers → verify. Fleet rollout = sequential, raw-SSH-first, per-node-type key.
-- **Test:** `test_healer.py` (import + monkeypatch — **no production impact**) + `live-test.sh` (induce real faults → verify → restore).
+## Build / test / deploy
 
-## 7. Design lessons (verify-before-concluding)
+```bash
+python3 build.py --check      # build healer.pyz + smoke-run it (DRY)
+python3 tests/test_healers.py # 56 unit tests (no production impact)
+```
 
-The coverage map was refined by **mid-deployment corrections**, not assumptions:
+Deploy: ship `healer.pyz`, point a `systemd` oneshot `ExecStart` at it, enable the
+timer. The agent re-reads itself each tick; rollout is sequential + verifies, and is
+trivially reverted (swap `ExecStart` back).
 
-- an overlay-SSH proxy banner ≠ "unreachable" (it auths silently via a cached token);
-- "older proxy version" ≠ "admin-broken" (only *some* nodes' backend hop fails);
-- `systemctl is-active`=`inactive` ≠ "stopped" (it also returns `inactive` for a **non-existent** unit);
-- a camera's midday flap ≠ thermal (it was a **PoE/LAN connection** fault);
-- "silent escalation" ≠ "no alerting" (an external dashboard/alerting already existed).
+## Design lessons (verify-before-concluding)
 
-Each became a **guardrail or an escalation rule** rather than a confident-but-wrong auto-fix.
+The coverage map was refined by mid-deployment corrections, not assumptions: an
+overlay-SSH proxy banner ≠ "unreachable"; `systemctl is-active`=`inactive` ≠
+"stopped" (it also returns for a non-existent unit); a camera's midday flap ≠ thermal
+(it was a PoE/LAN connection fault); a media server "up" with live HLS can still show
+clients **offline** if its broadcast *status* went stale after a restart. Each became
+a guardrail or an escalation rule rather than a confident-but-wrong auto-fix.
+
+## License
+
+MIT.

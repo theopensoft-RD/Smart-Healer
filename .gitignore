@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+/healer.pyz
+/healer.pyz.sig
+*.json.gz
+.env
+.DS_Store
+# release signing PRIVATE key — must never be published
+selfupdate/healer-release.key
+# dist/ IS published (signed release the fleet pulls): dist/healer.pyz · dist/healer.pyz.sig · dist/version
