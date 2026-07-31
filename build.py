@@ -55,7 +55,11 @@ def smoke(out):
     d = tempfile.mkdtemp()
     envf = os.path.join(d, ".env")
     open(envf, "w").write("DEVICE_ID=PAT-SMOKE-TEST\nRTMP_URL=rtmp://ams.invalid/CCTVApp/x\nMQTT_HOST=127.0.0.1\n")
-    env.update({"HEALER_DRY_RUN": "1", "HEALER_ENV_PATH": envf, "HEALER_GRACE_S": "0"})
+    # a THROWAWAY state dir: the heartbeat is rate-limited to 30min per state dir, so
+    # inheriting the real one made this smoke pass only on the first run of any half hour
+    # and report a false FAIL for the rest - a release gate that lies is worse than none.
+    env.update({"HEALER_DRY_RUN": "1", "HEALER_ENV_PATH": envf, "HEALER_GRACE_S": "0",
+                "HEALER_STATE_DIR": os.path.join(d, "state")})
     r = subprocess.run([sys.executable, out], env=env, capture_output=True, text=True, timeout=90)
     print(r.stdout.strip())
     ok = r.returncode == 0 and "agent.alive" in r.stdout   # heartbeat fires on first tick -> proves wire+run
@@ -64,7 +68,20 @@ def smoke(out):
     return ok
 
 
+def unit_tests():
+    """The behavioural suite. The node-side `selftest` only proves import+wire, so this
+    is the ONLY gate that proves the healers still behave - it must run before a release."""
+    t = os.path.join(HERE, "tests", "test_healers.py")
+    if not os.path.exists(t):
+        print("TESTS: SKIP (not found)")
+        return True
+    r = subprocess.run([sys.executable, t], capture_output=True, text=True, timeout=300)
+    print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "")
+    print("TESTS: %s" % ("PASS" if r.returncode == 0 else "FAIL"))
+    return r.returncode == 0
+
+
 if __name__ == "__main__":
     out = build()
     if out and "--check" in sys.argv:
-        sys.exit(0 if smoke(out) else 1)
+        sys.exit(0 if (unit_tests() and smoke(out)) else 1)

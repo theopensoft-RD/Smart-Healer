@@ -1,6 +1,6 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 520 - structured events for AI diagnosis). Deployed as a
+Modular package (rev 522 - multi-brand camera repair + verified H.264 enforcement). Deployed as a
 single zipapp artifact (healer.pyz) and
 driven by a systemd oneshot timer (~60s). Detect + remediate in-node faults with
 graduated, least-invasive-first remediation under hard guardrails.
@@ -23,4 +23,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "520"
+__version__ = "522"

@@ -50,6 +50,9 @@ CODES = {
                       "cause": "stream won't stay up", "fix": "check camera reachability/codec + ffmpeg journal"},
     "stream.camera-absent":  {"sev": "error", "desc": "stream down + no camera on LAN :554",
                       "cause": "camera unplugged / PoE water-ingress / LAN strain (physical)", "fix": "on-site: re-seat + waterproof PoE connector; strain-relief LAN"},
+    "stream.camera-path-unknown": {"sev": "error", "desc": "camera on :554 but brand not recognised",
+                      "cause": "camera replaced with an unsupported brand; RTSP path unknown",
+                      "fix": "identify the camera model, add its RTSP path to CAM_RTSP_PATH, set RTSP_URL"},
     "stream.camera-ambiguous": {"sev": "warn", "desc": "multiple cameras on LAN :554",
                       "cause": "more than one RTSP device", "fix": "human pick correct cam IP from d.found"},
 

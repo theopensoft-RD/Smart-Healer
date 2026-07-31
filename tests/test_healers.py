@@ -109,6 +109,118 @@ check("T5b cam-drift -> set H.264", rec["codec"] == ["192.168.1.150"])
 check("T5b cam-drift -> restart stream", "pat-smart-stream" in rec["restart"])
 check("T5b cam-drift -> NO false escalate", len(rec["escalate"]) == 0)
 
+# ---------------------------------------------------------------------------
+# T5c-T5h camera BRAND change at the SAME ip (Hikvision <-> Dahua).
+# Real incident 2026-07-31 pit004: a Dahua replaced the Hikvision on the same ip.
+# :554 stayed open -> the healer saw "camera fine" and only restarted the stream
+# forever, because it never validated the RTSP *path*. ffmpeg 404'd for a full day.
+# ---------------------------------------------------------------------------
+def mkbroken(url, **over):
+    """stream down (not pushing) but the camera ip IS reachable -> the brand-swap shape"""
+    o = {"svc_active": lambda s: True, "svc_age": lambda s: 999,
+         "estab_1935": lambda: 0, "tcp_up": lambda *a, **k: True}
+    o.update(over)
+    return mkctx(env={"RTSP_URL": "rtsp://admin:x@192.168.1.126:554" + url}, **o)
+
+def mkcam(rec, brand, works=None):
+    """works = the ONE path this camera really answers on. Everything else 404s,
+    so the healer has to discover it by probing, not by trusting a table."""
+    h = StreamCameraHealer()
+    h._scan_554 = lambda ctx: ["192.168.1.126"]
+    h._rtsp_ok = lambda ctx, url: bool(works) and url.endswith(works)
+    h._detect_brand = lambda ctx, ip, cred: brand
+    h._set_codec_h264 = lambda ctx, ip, cred: rec["codec"].append(ip)
+    h._repoint_cam = lambda ctx, ip: rec["repoint"].append(ip)
+    h._repoint_path = lambda ctx, p: rec["path"].append(p)
+    return h
+
+# T5c: Dahua now on the ip, .env still holds the old path -> repoint PATH, not ip
+ctx, rec = mkbroken("/stream0"); rec["path"] = []
+mkcam(rec, "dahua", works="/cam/realmonitor?channel=1&subtype=0").run(ctx)
+check("T5c dahua brand-swap -> repoint RTSP path",
+      rec["path"] == ["/cam/realmonitor?channel=1&subtype=0"])
+check("T5c dahua brand-swap -> restart stream", "pat-smart-stream" in rec["restart"])
+check("T5c dahua brand-swap -> ip untouched (only path wrong)", rec["repoint"] == [])
+check("T5c dahua brand-swap -> NO camera-absent (camera IS there)",
+      not esc_has(rec, "camera-absent"))
+
+# T5d: Hikvision that answers only on its non-first candidate -> probe past the miss
+ctx, rec = mkbroken("/cam/realmonitor?channel=1&subtype=0"); rec["path"] = []
+mkcam(rec, "hikvision", works="/Streaming/Channels/101").run(ctx)
+check("T5d hikvision brand-swap -> repoint to the path that answers",
+      rec["path"] == ["/Streaming/Channels/101"])
+
+# T5e: path already correct -> do NOT rewrite .env (no churn every 60s tick)
+ctx, rec = mkbroken("/cam/realmonitor?channel=1&subtype=0"); rec["path"] = []
+mkcam(rec, "dahua", works="/cam/realmonitor?channel=1&subtype=0").run(ctx)
+check("T5e path already OK -> NO .env rewrite", rec["path"] == [])
+
+# T5f: nothing answers on any candidate -> escalate, never write a guessed path
+ctx, rec = mkbroken("/stream0"); rec["path"] = []
+mkcam(rec, None, works=None).run(ctx)
+check("T5f no working path -> escalate camera-path-unknown", esc_has(rec, "camera-path-unknown"))
+check("T5f no working path -> NO blind path rewrite", rec["path"] == [])
+
+# T5i REGRESSION GUARD: this fleet's Hikvisions are wired with /stream0 and it WORKS.
+# A "canonical path" table would have rewritten 14 healthy nodes. Probe order must not
+# matter - only what actually answers does.
+ctx, rec = mkbroken("/broken"); rec["path"] = []
+mkcam(rec, "hikvision", works="/stream0").run(ctx)
+check("T5i hikvision keeps the fleet's working /stream0", rec["path"] == ["/stream0"])
+
+# T5j: unknown brand but a candidate DOES answer -> repair anyway, don't call a human out
+ctx, rec = mkbroken("/broken"); rec["path"] = []
+mkcam(rec, None, works="/cam/realmonitor?channel=1&subtype=0").run(ctx)
+check("T5j unknown brand + working candidate -> self-heal, no escalate",
+      rec["path"] == ["/cam/realmonitor?channel=1&subtype=0"] and not esc_has(rec, "camera-path-unknown"))
+
+# T5g: brand detection reads the real probe endpoints (not hardcoded to ISAPI)
+h = StreamCameraHealer()
+_calls = []
+ctx, rec = mkbroken("/stream0", sh=lambda c, timeout=15: (
+    _calls.append(c) or ((0, "type=DH-IPC-HDW1439V-A-IL", "") if "magicBox" in c else (0, "404 Not Found", ""))))
+check("T5g detect dahua via magicBox.cgi", h._detect_brand(ctx, "192.168.1.126", "admin:x") == "dahua")
+ctx, rec = mkbroken("/stream0", sh=lambda c, timeout=15: (
+    (0, "<DeviceInfo><model>DS-2CD</model></DeviceInfo>", "") if "ISAPI" in c else (0, "", "")))
+check("T5g detect hikvision via ISAPI", h._detect_brand(ctx, "192.168.1.126", "admin:x") == "hikvision")
+
+# T5h: H.264 enforcement must use the DAHUA api on a dahua cam (was ISAPI-only -> silent no-op)
+def dahua_cam(rec, after):
+    """after = what getConfig reports AFTER the setConfig attempt"""
+    seen = {"set": False}
+    def _sh(c, timeout=15):
+        rec["sent"].append(c)
+        if "magicBox" in c:
+            return (0, "type=DH-IPC", "")
+        if "setConfig" in c:
+            seen["set"] = True
+            return (0, "OK", "")
+        if "getConfig" in c:
+            return (0, after if seen["set"] else
+                    "table.Encode[0].MainFormat[0].Video.Compression=H.265", "")
+        return (0, "", "")
+    return _sh
+
+ctx, rec = mkbroken("/stream0"); rec["sent"] = []
+ctx, rec2 = mkbroken("/stream0", sh=dahua_cam(rec, "table.Encode[0].MainFormat[0].Video.Compression=H.264"))
+StreamCameraHealer()._set_codec_h264(ctx, "192.168.1.126", "admin:x")
+check("T5h dahua codec -> uses configManager.cgi (not ISAPI)",
+      any("configManager.cgi" in c and "H.264" in c for c in rec["sent"]))
+# T5k: the brackets MUST be percent-encoded. Raw 'Encode[0]' -> camera rejects with an
+# EMPTY body and the old code logged success anyway (pit004 streamed black for a day).
+check("T5k dahua setConfig percent-encodes the brackets",
+      any("Encode%5B0%5D.MainFormat%5B0%5D" in c for c in rec["sent"])
+      and not any("Encode[0].MainFormat[0]" in c for c in rec["sent"]))
+check("T5k verified success is logged only after read-back",
+      any("verified" in m for m in rec2["log"]))
+
+# T5l: camera refuses H.264 -> say so. NEVER log a success we did not observe.
+ctx, rec = mkbroken("/stream0"); rec["sent"] = []
+ctx, rec3 = mkbroken("/stream0", sh=dahua_cam(rec, "table.Encode[0].MainFormat[0].Video.Compression=H.265"))
+StreamCameraHealer()._set_codec_h264(ctx, "192.168.1.126", "admin:x")
+check("T5l dahua refuses H.264 -> logged as REFUSED, not success",
+      any("REFUSED" in m for m in rec3["log"]) and not any("verified" in m for m in rec3["log"]))
+
 # T4 radar: circuit stuck + recoverable -> restart
 ctx, rec = mkctx(journal=lambda u, n=20: "[radar] read error (circuit=open): TimeoutError",
                  online_recent=lambda u, m=3: False, tcp_up=lambda *a, **k: True)
@@ -309,6 +421,7 @@ _expected = ["dependency.redis-down-rate-exceeded", "dependency.redis-restart-fa
     "liveness.svc-crash-loop", "liveness.svc-restart-failed",
     "radar.vegamet-fault-or-stuck", "radar.sensor-moved", "radar.sensor-absent", "radar.sensor-ambiguous",
     "stream.stream-repair-rate-exceeded", "stream.camera-absent", "stream.camera-ambiguous",
+    "stream.camera-path-unknown",
     "stream-republish.republish-rate-exceeded", "stream-republish.republish-restart-failed",
     "stream-republish.republish-no-rtmp-after-restart",
     "beszel.beszel-agent-restart-rate-exceeded", "beszel.beszel-agent-restart-failed",
