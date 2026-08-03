@@ -249,6 +249,129 @@ check("F17-j jitter stable per node", off1 == off1b and 0 <= off1 < 150)
 check("F17-j jitter differs by node (staggered)", off1 != off2)
 
 # ===========================================================================
+# F10e ec25 uplink recovery (IRIV internal Quectel EC25) - the modem-reset path
+# The ONLY healer that actively repairs the uplink. It has no external watchdog
+# to fall back on, and it runs on nodes that are painful to reach physically, so
+# every guard (confirm / settle / rate / dry-run / rc) is pinned here.
+# ===========================================================================
+
+def sh_stub(log, rules=None, rc=0, out="", err=""):
+    """Recording shell stub. rules = [(fragment, (rc, out, err)), ...] matched in order."""
+    def _sh(c, timeout=15):
+        log.append(c)
+        for frag, ret in (rules or []):
+            if frag in c:
+                return ret
+        return (rc, out, err)
+    return _sh
+
+def issued_reset(log):
+    return [c for c in log if "--reset" in c]
+
+DOWN = {"tcp_up": lambda *a, **k: False}       # WAN down on both probes
+
+# F10e-a: first down-tick -> count only, NO reset (a flap is not an outage)
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), **DOWN); ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-a ec25 tick1 -> NO modem reset (confirm guard)", issued_reset(_L) == [])
+check("F10e-a ec25 tick1 -> down counted =1", rec["saved"] and rec["saved"].get("down") == 1)
+check("F10e-a ec25 tick1 -> NO premature escalate", len(rec["escalate"]) == 0)
+
+# F10e-b: down reaches WAN_DOWN_CONFIRM -> reset the MODEM (exact command), arm the settle window
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 2}, **DOWN); ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-b confirmed outage -> resets modem via mmcli",
+      issued_reset(_L) == ["sudo -n /usr/bin/mmcli -m any --reset"])
+check("F10e-b reset -> rate accounted (cannot reset-loop)", rec["rate_hit"] == ["connectivity"])
+check("F10e-b reset -> settle window armed (reset_ts set)", rec["saved"] and rec["saved"].get("reset_ts"))
+# safety invariant: repairing the uplink must never reboot the node or touch netbird
+check("F10e-b SAFETY no service restart", len(rec["restart"]) == 0)
+check("F10e-b SAFETY no reboot / no netbird in any command",
+      not any(("reboot" in c or "netbird" in c) for c in _L))
+
+# F10e-c: inside the settle window -> wait, do NOT reset again
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 5, "reset_ts": time.time()}, **DOWN)
+ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-c within settle -> NO second reset", issued_reset(_L) == [])
+check("F10e-c within settle -> no escalate yet", len(rec["escalate"]) == 0)
+
+# F10e-d: reset + settle elapsed + STILL down -> not a soft wedge; escalate to a human
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 5, "reset_ts": time.time() - 9999}, **DOWN)
+ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-d reset didn't help -> escalate ec25-reset-no-recovery",
+      esc_has(rec, "ec25-reset-no-recovery"))
+check("F10e-d reset didn't help -> NO further reset", issued_reset(_L) == [])
+check("F10e-d -> settle window disarmed", rec["saved"] and not rec["saved"].get("reset_ts"))
+
+# F10e-e: rate exceeded (flapping 4G) -> escalate, never keep resetting
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 2}, rate_ok=lambda n: False, **DOWN)
+ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-e rate exceeded -> escalate ec25-reset-rate-exceeded",
+      esc_has(rec, "ec25-reset-rate-exceeded"))
+check("F10e-e rate exceeded -> NO reset", issued_reset(_L) == [])
+
+# F10e-f: the reset command itself fails (missing sudoers / ModemManager down) -> escalate, do NOT arm settle
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L, rc=1, err="sudo: a password is required"), state={"down": 2}, **DOWN)
+ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-f reset failed -> escalate ec25-reset-failed", esc_has(rec, "ec25-reset-failed"))
+check("F10e-f reset failed -> settle NOT armed (retry next tick)",
+      rec["saved"] and not rec["saved"].get("reset_ts"))
+
+# F10e-g: dry-run -> decide and log, touch nothing (the safe rehearsal we deploy with)
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 2}, **DOWN)
+ctx.cfg.uplink = "ec25"; ctx.cfg.dry_run = True
+ConnectivityHealer().run(ctx)
+check("F10e-g dry-run -> NO reset executed", issued_reset(_L) == [])
+check("F10e-g dry-run -> says what it WOULD do", any("would reset modem" in m for m in rec["log"]))
+
+# F10e-h: WAN back after a reset -> clear the counters so the next outage starts clean
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), state={"down": 4, "reset_ts": time.time()})   # tcp_up default True
+ctx.cfg.uplink = "ec25"
+ConnectivityHealer().run(ctx)
+check("F10e-h recovered -> counters cleared",
+      rec["saved"] and rec["saved"].get("down") == 0 and rec["saved"].get("reset_ts") == 0)
+check("F10e-h recovered -> logged as post-reset recovery",
+      any("recovered after modem reset" in m for m in rec["log"]))
+
+# --- uplink classification: the wrong class would either reset a Robustel node or strand an IRIV ---
+
+# F10u-a: explicit robustel -> detect+escalate only, and don't even probe for a modem
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), **DOWN); ctx.cfg.uplink = "robustel"
+ConnectivityHealer().run(ctx)
+check("F10u-a robustel -> escalate detect-only", esc_has(rec, "wan-down-detect-only"))
+check("F10u-a robustel -> NO reset (Robustel self-reboots off-node)", issued_reset(_L) == [])
+check("F10u-a explicit uplink -> skips modem probing", _L == [])
+
+# F10u-b: auto-detect finds a Quectel EC25 -> ec25 path (counts down, does not escalate detect-only)
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L, rules=[("mmcli -L", (0, "/org/.../Modem/0 [Quectel] EC25", ""))]), **DOWN)
+ctx.cfg.uplink = "auto"
+ConnectivityHealer().run(ctx)
+check("F10u-b auto-detect EC25 -> classified ec25", rec["saved"] and rec["saved"].get("uplink") == "ec25")
+check("F10u-b auto-detect EC25 -> NOT the detect-only path", not esc_has(rec, "wan-down-detect-only"))
+
+# F10u-c: auto-detect finds no modem -> robustel (never invent an ec25 node)
+_L = []
+ctx, rec = mkctx(sh=sh_stub(_L), **DOWN); ctx.cfg.uplink = "auto"
+ConnectivityHealer().run(ctx)
+check("F10u-c auto-detect no modem -> robustel", rec["saved"] and rec["saved"].get("uplink") == "robustel")
+check("F10u-c auto-detect no modem -> escalate detect-only", esc_has(rec, "wan-down-detect-only"))
+check("F10u-c auto-detect no modem -> NO reset", issued_reset(_L) == [])
+
+# ===========================================================================
 # Structural: runner isolation + registry
 # ===========================================================================
 
@@ -265,11 +388,33 @@ check("T-runner isolates raising healer -> agent.exc", any(c == "agent.exc" and 
 check("T-runner continues after exception", any("ok-ran" in m for m in rec["log"]))
 check("T-runner tick completes -> heartbeat", len(rec["hb"]) >= 1)
 
-# T-runner: no DEVICE_ID -> abort event, never act on an unidentified node
+# T-runner: no DEVICE_ID -> infra-only mode (rev 521). A signage/IRIV node has no
+# sensor identity but still needs its 4G/disk/beszel healers; the sensor+stream
+# healers stay gated, so an unidentified node can never act on someone's sensor.
+class InfraOnly:
+    name = "infra-ok"; requires_identity = False
+    def run(self, ctx): ctx.log("infra-ran")
 ctx, rec = mkctx(); ctx.cfg.device_id = ""
-runner.run(cfg=ctx.cfg, ctx=ctx, registry=[Ok()])
-check("T-runner no-DEVICE_ID -> agent.abort, no run",
-      any(c == "agent.abort" for c, _ in rec["events"]) and not any("ok-ran" in m for m in rec["log"]))
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[InfraOnly(), Ok()])
+check("T-runner no-DEVICE_ID -> agent.infra-only event",
+      any(c == "agent.infra-only" for c, _ in rec["events"]))
+check("T-runner no-DEVICE_ID -> infra healer RUNS", any("infra-ran" in m for m in rec["log"]))
+check("T-runner no-DEVICE_ID -> identity healer GATED", not any("ok-ran" in m for m in rec["log"]))
+check("T-runner no-DEVICE_ID -> heartbeat counts only what ran",
+      rec["hb"] and rec["hb"][-1].get("healers") == 1)
+
+# T-runner: WITH a DEVICE_ID -> everything runs, no infra-only marker
+ctx, rec = mkctx()
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[InfraOnly(), Ok()])
+check("T-runner with DEVICE_ID -> all healers run",
+      any("infra-ran" in m for m in rec["log"]) and any("ok-ran" in m for m in rec["log"]))
+check("T-runner with DEVICE_ID -> no infra-only marker",
+      not any(c == "agent.infra-only" for c, _ in rec["events"]))
+
+# T-registry: exactly the 3 infra healers survive on an identity-less node
+_infra = sorted(h.name for h in default_registry() if not getattr(h, "requires_identity", True))
+check("T-registry infra set = connectivity/disk-hygiene/beszel",
+      _infra == ["beszel", "connectivity", "disk-hygiene"])
 
 # T-registry: 8 healers, dependency-first order, unique names, F17 after stream-camera
 reg = default_registry()
@@ -312,9 +457,12 @@ _expected = ["dependency.redis-down-rate-exceeded", "dependency.redis-restart-fa
     "stream-republish.republish-rate-exceeded", "stream-republish.republish-restart-failed",
     "stream-republish.republish-no-rtmp-after-restart",
     "beszel.beszel-agent-restart-rate-exceeded", "beszel.beszel-agent-restart-failed",
-    "connectivity.wan-down-detect-only"]
+    "connectivity.wan-down-detect-only",
+    "connectivity.ec25-reset-failed", "connectivity.ec25-reset-no-recovery",
+    "connectivity.ec25-reset-rate-exceeded"]
 _missing = [x for x in _expected if x not in SCH.CODES]
 check("E2 manifest covers all escalation codes", not _missing)
+check("E2 manifest decodes agent.infra-only", "agent.infra-only" in SCH.CODES)
 check("E2 every code has sev+desc+cause+fix (AI playbook)",
       all(all(k in SCH.CODES[x] for k in ("sev", "desc", "cause", "fix")) for x in SCH.CODES))
 
