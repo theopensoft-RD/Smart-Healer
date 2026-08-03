@@ -23,6 +23,9 @@ CODES = {
                       "cause": ".env missing/unreadable or DEVICE_ID unset", "fix": "restore ~/.config/pat-smart/.env"},
     "agent.infra-only": {"sev": "info", "desc": "identity-less node (no DEVICE_ID): ran infra healers only (connectivity/disk/beszel), gated the sensor/stream healers",
                       "cause": "node has no sensor identity (e.g. pisn signage IRIV)", "fix": "normal for signage/infra nodes; set DEVICE_ID to enable sensor healers"},
+    "agent.state-unwritable": {"sev": "error", "desc": "state dir not writable: the rate limiter AND the local event log are dead. Healers still act, but UNCAPPED - a repair is never withheld because a quota record failed",
+                      "cause": "state dir owned by another user (the radar/stream services run as root; whoever created the dir first owns it) or the disk is full",
+                      "fix": "sudo chown admin:admin ~/.local/state/pat-smart ~/.local/state/pat-smart/logs; check df -h; then systemctl start pat-fleet-healer.service and confirm events.jsonl appears"},
 
     # --- dependency (F12 redis) ---
     "dependency.redis-down-rate-exceeded": {"sev": "warn", "desc": "redis down + restart rate exceeded",

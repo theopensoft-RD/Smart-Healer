@@ -45,11 +45,13 @@ def emit(cfg, code, fields=None, push=None):
     meta = CODES.get(code, {})
     sev = meta.get("sev", "info")
     line = _atom(cfg, code, fields)
-    os.makedirs(cfg.state_dir, exist_ok=True)
 
-    # 1. canonical structured JSONL
+    # 1. canonical structured JSONL. makedirs is INSIDE the guard: an unwritable
+    #    parent makes makedirs itself raise, and emit() is called from runner
+    #    OUTSIDE the per-healer try -> a raise here would kill the whole tick.
     jpath = os.path.join(cfg.state_dir, EVENTS_FILE)
     try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
         open(jpath, "a").write(line + "\n")
         _rotate_if_big(jpath)
     except Exception:

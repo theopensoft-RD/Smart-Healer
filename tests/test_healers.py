@@ -67,6 +67,7 @@ def mkctx(state=None, env=None, **over):
         "escalate":      lambda h, v, ev=None: rec["escalate"].append((h, v)),
         "state_load":    lambda name: dict(_st),
         "state_save":    _save,
+        "state_writable": lambda: True,
         "event":         lambda code, **f: rec["events"].append((code, f)),
         "heartbeat":     lambda **f: rec["hb"].append(f),
     }
@@ -425,6 +426,96 @@ check("T-registry dependency first", names[0] == "dependency")
 check("T-registry F17 after stream-camera", names.index("stream-republish") == names.index("stream") + 1)
 
 # ===========================================================================
+# S* unwritable state dir - the failure that looked like perfect health
+#
+# Real incident (KB rev 1138): the state dir was root-owned on 4 nodes, so
+# rate_hit() raised PermissionError on the line BEFORE every repair. runner
+# swallowed it as agent.exc and the tick "completed"; systemd said active and
+# journald showed heartbeats. pit002 detected 220 faults in 7 days and performed
+# ZERO repairs. These tests use a REAL unwritable directory, not a stub.
+# ===========================================================================
+from pat_fleet_healer.core import state as ST
+
+def unwritable_cfg():
+    """A real directory the process genuinely cannot write into."""
+    c = Config(env_path=os.devnull, overrides={})
+    c.device_id = "PAT-RO-001"; c.dry_run = False; c.grace_s = 120
+    d = tempfile.mkdtemp(); _TMP.append(d)
+    c.state_dir = os.path.join(d, "pat-smart")
+    os.makedirs(c.state_dir)
+    os.chmod(c.state_dir, 0o500)                 # r-x: listable, NOT writable
+    return c
+
+_ro = unwritable_cfg()
+# precondition: if this fails the whole section is vacuous (e.g. running as root)
+check("S0 harness really produced an unwritable dir", not os.access(_ro.state_dir, os.W_OK))
+
+# S1: rate_hit must never raise - it sits one line above every repair
+_raised = None
+try:
+    _wrote = ST.rate_hit(_ro, "svc")
+except Exception as e:
+    _raised = e; _wrote = None
+check("S1 rate_hit does NOT raise when state is unwritable", _raised is None)
+check("S1 rate_hit reports it did not persist", _wrote is False)
+
+# S2: end-to-end - a real healer with a real unwritable dir must STILL repair.
+# Only rate_hit/rate_ok are wired to the real implementation; restart stays a stub.
+ctx, rec = mkctx(svc_active=lambda s: (s != "pat-smart-stream"), svc_age=lambda s: 999)
+ctx.cfg.state_dir = _ro.state_dir
+ctx._svc["rate_ok"] = lambda n: ST.rate_ok(ctx.cfg, n)
+ctx._svc["rate_hit"] = lambda n: ST.rate_hit(ctx.cfg, n)
+ServiceLivenessHealer().run(ctx)
+check("S2 unwritable state -> the repair STILL happens", "pat-smart-stream" in rec["restart"])
+
+# S3: and the lost cap is announced, not silent
+ctx, rec = mkctx(state_writable=lambda: False)
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[Ok()])
+check("S3 unwritable state -> agent.state-unwritable emitted",
+      any(c == "agent.state-unwritable" for c, _ in rec["events"]))
+check("S3 the event names the offending dir",
+      any(c == "agent.state-unwritable" and "dir" in f for c, f in rec["events"]))
+check("S3 unwritable state -> healers still run", any("ok-ran" in m for m in rec["log"]))
+check("S3 unwritable state -> tick still completes", len(rec["hb"]) >= 1)
+
+# S4: writable state must stay quiet (no false alarm on 57 healthy nodes)
+ctx, rec = mkctx()
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[Ok()])
+check("S4 writable state -> NO state-unwritable alarm",
+      not any(c == "agent.state-unwritable" for c, _ in rec["events"]))
+
+# S5: the guard must not break real rate limiting on healthy nodes
+_ok = real_cfg_ro = Config(env_path=os.devnull, overrides={})
+_ok.device_id = "PAT-RW-001"; _ok.state_dir = tempfile.mkdtemp(); _TMP.append(_ok.state_dir)
+check("S5 writable rate_hit persists (returns True)", ST.rate_hit(_ok, "svc") is True)
+check("S5 rate file actually written", os.path.exists(os.path.join(_ok.state_dir, "healer-rate.json")))
+for _ in range(_ok.rate_max + 2):
+    ST.rate_hit(_ok, "svc")
+check("S5 quota still closes the gate after rate_max", ST.rate_ok(_ok, "svc") is False)
+check("S5 a different healer keeps its own quota", ST.rate_ok(_ok, "other") is True)
+
+# S6: state.writable() is a round-trip probe, not a guess
+check("S6 writable() True on a writable dir", ST.writable(_ok) is True)
+check("S6 writable() False on the unwritable dir", ST.writable(_ro) is False)
+check("S6 probe leaves no litter", ".wtest" not in os.listdir(_ok.state_dir))
+
+# S7: the other writers in the same class must not raise either
+#     (makedirs used to sit OUTSIDE their try -> an unwritable PARENT raised)
+_deep = Config(env_path=os.devnull, overrides={})
+_deep.device_id = "PAT-RO-002"
+_deep.state_dir = os.path.join(_ro.state_dir, "cannot", "create")   # parent is r-x
+_raised = None
+try:
+    ST.save(_deep, "conn", {"down": 1})
+    from pat_fleet_healer.core import events as _EV
+    _EV.emit(_deep, "agent.log", {"msg": "x"})
+except Exception as e:
+    _raised = e
+check("S7 save() + emit() do NOT raise when the dir cannot even be created", _raised is None)
+
+os.chmod(_ro.state_dir, 0o700)                   # let the temp cleanup remove it
+
+# ===========================================================================
 # Event system (real emit / manifest / bundle) - the AI-diagnosis logging layer
 # ===========================================================================
 import gzip
@@ -463,6 +554,9 @@ _expected = ["dependency.redis-down-rate-exceeded", "dependency.redis-restart-fa
 _missing = [x for x in _expected if x not in SCH.CODES]
 check("E2 manifest covers all escalation codes", not _missing)
 check("E2 manifest decodes agent.infra-only", "agent.infra-only" in SCH.CODES)
+check("E2 manifest decodes agent.state-unwritable", "agent.state-unwritable" in SCH.CODES)
+check("E2 state-unwritable is sev=error (so it pushes to central)",
+      SCH.CODES.get("agent.state-unwritable", {}).get("sev") == "error")
 check("E2 every code has sev+desc+cause+fix (AI playbook)",
       all(all(k in SCH.CODES[x] for k in ("sev", "desc", "cause", "fix")) for x in SCH.CODES))
 
