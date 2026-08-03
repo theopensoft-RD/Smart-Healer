@@ -9,6 +9,7 @@ from .base import Healer
 
 class DiskHygieneHealer(Healer):
     name = "disk-hygiene"
+    requires_identity = False        # infra: runs on identity-less nodes (pisn signage / IRIV) too
 
     def run(self, ctx):
         now = time.time()

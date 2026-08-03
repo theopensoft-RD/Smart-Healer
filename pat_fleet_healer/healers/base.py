@@ -8,6 +8,7 @@ entry point, run(ctx). Implementations MUST stay guardrailed:
 
 class Healer:
     name = "healer"
+    requires_identity = True        # default: gated on DEVICE_ID. Infra healers (4G/disk/beszel) override to False.
 
     def run(self, ctx):
         raise NotImplementedError
