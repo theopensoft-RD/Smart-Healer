@@ -21,6 +21,11 @@ CODES = {
                       "cause": "bug or unexpected node state in d.healer", "fix": "inspect d.err; reproduce with HEALER_DRY_RUN=1"},
     "agent.abort":   {"sev": "warn",  "desc": "tick aborted: no DEVICE_ID in .env",
                       "cause": ".env missing/unreadable or DEVICE_ID unset", "fix": "restore ~/.config/pat-smart/.env"},
+    "agent.infra-only": {"sev": "info", "desc": "identity-less node (no DEVICE_ID): ran infra healers only (connectivity/disk/beszel), gated the sensor/stream healers",
+                      "cause": "node has no sensor identity (e.g. pisn signage IRIV)", "fix": "normal for signage/infra nodes; set DEVICE_ID to enable sensor healers"},
+    "agent.state-unwritable": {"sev": "error", "desc": "state dir not writable: the rate limiter AND the local event log are dead. Healers still act, but UNCAPPED - a repair is never withheld because a quota record failed",
+                      "cause": "state dir owned by another user (the radar/stream services run as root; whoever created the dir first owns it) or the disk is full",
+                      "fix": "sudo chown admin:admin ~/.local/state/pat-smart ~/.local/state/pat-smart/logs; check df -h; then systemctl start pat-fleet-healer.service and confirm events.jsonl appears"},
 
     # --- dependency (F12 redis) ---
     "dependency.redis-down-rate-exceeded": {"sev": "warn", "desc": "redis down + restart rate exceeded",
@@ -70,9 +75,16 @@ CODES = {
     "beszel.beszel-agent-restart-failed":        {"sev": "warn", "desc": "beszel-agent restart failed",
                       "cause": "unit/binary", "fix": "manual restart beszel-agent"},
 
-    # --- connectivity (F10) ---
-    "connectivity.wan-down-detect-only": {"sev": "warn", "desc": "4G WAN down (detect+escalate only; never reboot from healer)",
-                      "cause": "Robustel/4G uplink down", "fix": "Robustel self-reboot handles recovery; if persists, on-site check antenna/SIM"},
+    # --- connectivity (F10) — uplink-aware ---
+    "connectivity.wan-down-detect-only": {"sev": "warn", "desc": "4G WAN down; robustel uplink -> detect+escalate only (Robustel self-reboots off-node; healer never reboots Robustel/netbird)",
+                      "cause": "Robustel/4G uplink down", "fix": "Robustel emergency_reboot handles recovery; if persists, on-site check antenna/SIM"},
+    # ec25 (IRIV internal Quectel EC25): no external watchdog -> healer resets the modem (mmcli -m any --reset)
+    "connectivity.ec25-reset-failed":      {"sev": "error", "desc": "EC25 modem reset command failed",
+                      "cause": "mmcli/ModemManager error or missing NOPASSWD sudoers for 'mmcli -m any --reset'", "fix": "check ModemManager.service active + sudoers; run 'sudo -n mmcli -m any --reset' by hand"},
+    "connectivity.ec25-reset-no-recovery": {"sev": "error", "desc": "EC25 modem was reset but WAN still down after settle (not a soft wedge)",
+                      "cause": "SIM/coverage/antenna/hardware fault", "fix": "on-site: re-seat SIM + 4G antenna, check signal/data plan; swap modem if persistent"},
+    "connectivity.ec25-reset-rate-exceeded": {"sev": "warn", "desc": "EC25 modem reset rate exceeded (repeated WAN drops)",
+                      "cause": "flapping 4G / marginal coverage", "fix": "check antenna/signal/data-plan; relocate antenna or consider dual-SIM"},
 }
 
 

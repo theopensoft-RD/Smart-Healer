@@ -8,6 +8,7 @@ from .base import Healer
 
 class BeszelAgentHealer(Healer):
     name = "beszel"
+    requires_identity = False        # infra: monitoring agent, runs on identity-less nodes too
 
     def run(self, ctx):
         svc = "beszel-agent"

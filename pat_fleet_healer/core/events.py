@@ -22,7 +22,7 @@ ROTATE_BYTES = 4 * 1024 * 1024          # gzip-rotate the local JSONL past 4 MB
 
 
 def _atom(cfg, code, fields):
-    a = {"t": int(time.time()), "n": cfg.device_id, "e": code}
+    a = {"t": int(time.time()), "n": cfg.node_id, "e": code}
     if fields:
         a["d"] = fields
     return json.dumps(a, ensure_ascii=False, separators=(",", ":"))
@@ -45,11 +45,13 @@ def emit(cfg, code, fields=None, push=None):
     meta = CODES.get(code, {})
     sev = meta.get("sev", "info")
     line = _atom(cfg, code, fields)
-    os.makedirs(cfg.state_dir, exist_ok=True)
 
-    # 1. canonical structured JSONL
+    # 1. canonical structured JSONL. makedirs is INSIDE the guard: an unwritable
+    #    parent makes makedirs itself raise, and emit() is called from runner
+    #    OUTSIDE the per-healer try -> a raise here would kill the whole tick.
     jpath = os.path.join(cfg.state_dir, EVENTS_FILE)
     try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
         open(jpath, "a").write(line + "\n")
         _rotate_if_big(jpath)
     except Exception:
@@ -72,7 +74,7 @@ def emit(cfg, code, fields=None, push=None):
     if push:
         try:
             import paho.mqtt.publish as publish
-            publish.single("fleet/events/%s" % cfg.device_id, payload=line,
+            publish.single("fleet/events/%s" % cfg.node_id, payload=line,
                            hostname=cfg.mqtt_host, port=1883, keepalive=10)
         except Exception:
             pass

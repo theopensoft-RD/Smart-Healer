@@ -2,6 +2,7 @@
 env-overridable for tests and per-node tuning. Pass `overrides` (a dict) to
 construct a Config without touching os.environ - used by the test suite."""
 import os
+import socket
 
 
 class Config:
@@ -11,10 +12,13 @@ class Config:
         self.env = self._load_env(self.env_path)
 
         # identity / targets
-        self.device_id   = self.env.get("DEVICE_ID", "")
+        self.device_id   = self.env.get("DEVICE_ID", "")       # SENSOR identity; gates sensor/stream healers (empty on signage)
+        self.hostname    = socket.gethostname() or "unknown"
         # radar.py reads env HOST (default .106) -> match it so we probe the RIGHT sensor IP
         self.modbus_host = self.env.get("HOST") or self.env.get("MODBUS_HOST") or "192.168.1.106"
         self.mqtt_host   = self.env.get("MQTT_HOST", "localhost")
+        # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
+        self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 
         # runtime
         self.dry_run = o.get("HEALER_DRY_RUN", "0") == "1"
@@ -41,6 +45,10 @@ class Config:
         self.republish_settle_s = int(o.get("REPUBLISH_SETTLE_S", "30"))  # let AMS settle before re-publishing
         self.republish_spread_s = int(o.get("REPUBLISH_SPREAD_S", "150")) # stagger window across the fleet
 
+        # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
+        self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)
+        self.ec25_settle_s    = int(o.get("EC25_SETTLE_S", "45"))     # wait after modem reset before judging recovery (< ~60s tick)
+
     @staticmethod
     def _load_env(path):
         d = {}
@@ -54,6 +62,12 @@ class Config:
         except Exception:
             pass
         return d
+
+    @property
+    def node_id(self):
+        # telemetry identity for events/MQTT: sensor DEVICE_ID if present, else hostname
+        # -> infra-only signage nodes (pisn, no sensor DEVICE_ID) stay attributable (PTY-PISN00x)
+        return self.device_id or self.hostname
 
     def state_path(self, name):
         return os.path.join(self.state_dir, name)

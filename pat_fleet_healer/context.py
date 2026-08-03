@@ -50,6 +50,7 @@ def production_context(cfg):
         "rate_hit":      lambda n: state.rate_hit(cfg, n),
         "state_load":    lambda name: state.load(cfg, name),
         "state_save":    lambda name, d: state.save(cfg, name, d),
+        "state_writable": lambda: state.writable(cfg),
         # structured events (canonical) + back-compat shims
         "event":         lambda code, **f: events.emit(cfg, code, f or None),
         "escalate":      lambda h, v, ev=None: events.emit(cfg, h.split(":")[0] + "." + v, ev or {}, push=True),
