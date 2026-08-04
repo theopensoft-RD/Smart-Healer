@@ -11,6 +11,7 @@ from .stream_republish import StreamRepublishHealer
 from .beszel_agent import BeszelAgentHealer
 from .connectivity import ConnectivityHealer
 from .disk_hygiene import DiskHygieneHealer
+from .net_probe import NetProbeHealer
 
 
 def default_registry():
@@ -23,4 +24,5 @@ def default_registry():
         BeszelAgentHealer(),
         ConnectivityHealer(),
         DiskHygieneHealer(),
+        NetProbeHealer(),      # measures only; must run last so it sees the settled state
     ]

@@ -29,7 +29,7 @@ def main():
             from .context import production_context
             from .runner import run
             run(cfg=cfg)                               # a DRY tick to the temp state dir
-            assert len(default_registry()) == 8
+            assert len(default_registry()) == 9
             print("selftest OK")
             sys.exit(0)
         except Exception as e:

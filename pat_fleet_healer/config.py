@@ -45,6 +45,10 @@ class Config:
         self.republish_settle_s = int(o.get("REPUBLISH_SETTLE_S", "30"))  # let AMS settle before re-publishing
         self.republish_spread_s = int(o.get("REPUBLISH_SPREAD_S", "150")) # stagger window across the fleet
 
+        # phase-1 network probe: outage duration + carrier-vs-onsite discriminator.
+        # Transitions are recorded every tick; this is only the telemetry cadence.
+        self.probe_sample_s = int(o.get("PROBE_SAMPLE_S", "300"))
+
         # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
         self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)
         self.ec25_settle_s    = int(o.get("EC25_SETTLE_S", "45"))     # wait after modem reset before judging recovery (< ~60s tick)

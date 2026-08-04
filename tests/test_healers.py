@@ -27,6 +27,7 @@ from pat_fleet_healer.healers.stream_republish import StreamRepublishHealer
 from pat_fleet_healer.healers.beszel_agent import BeszelAgentHealer
 from pat_fleet_healer.healers.connectivity import ConnectivityHealer
 from pat_fleet_healer.healers.disk_hygiene import DiskHygieneHealer
+from pat_fleet_healer.healers.net_probe import NetProbeHealer
 from pat_fleet_healer.healers.registry import default_registry
 from pat_fleet_healer import runner
 
@@ -526,13 +527,13 @@ check("T-runner with DEVICE_ID -> no infra-only marker",
 
 # T-registry: exactly the 3 infra healers survive on an identity-less node
 _infra = sorted(h.name for h in default_registry() if not getattr(h, "requires_identity", True))
-check("T-registry infra set = connectivity/disk-hygiene/beszel",
-      _infra == ["beszel", "connectivity", "disk-hygiene"])
+check("T-registry infra set = beszel/connectivity/disk-hygiene/net-probe",
+      _infra == ["beszel", "connectivity", "disk-hygiene", "net-probe"])
 
 # T-registry: 8 healers, dependency-first order, unique names, F17 after stream-camera
 reg = default_registry()
 names = [h.name for h in reg]
-check("T-registry has 8 healers", len(reg) == 8)
+check("T-registry has 9 healers", len(reg) == 9)
 check("T-registry names unique", len(set(names)) == len(names))
 check("T-registry dependency first", names[0] == "dependency")
 check("T-registry F17 after stream-camera", names.index("stream-republish") == names.index("stream") + 1)
@@ -626,6 +627,161 @@ except Exception as e:
 check("S7 save() + emit() do NOT raise when the dir cannot even be created", _raised is None)
 
 os.chmod(_ro.state_dir, 0o700)                   # let the temp cleanup remove it
+
+# ===========================================================================
+# P* phase-1 network probe - measures, never remediates
+#
+# Its whole purpose is to answer "carrier or cabinet?" when the WAN drops, and to
+# record how long each outage lasted. The null-vs-zero tests below are not
+# pedantry: conflating "could not measure" with "measured zero" is precisely what
+# invalidated the 2026-08-03 fleet report.
+# ===========================================================================
+import json as _pj
+
+def sh_net(route="default via 192.168.1.1 dev eth0 proto dhcp", ping="up", rtt="2.1"):
+    """Stub `ip route` + `ping`. ping: 'up' | 'down' | 'missing' (command absent)."""
+    def _sh(c, timeout=15):
+        if "ip route" in c:
+            return (0, route, "")
+        if c.startswith("ping"):
+            if ping == "missing":
+                return (127, "", "ping: command not found")
+            if ping == "up":
+                return (0, "2 packets transmitted, 2 received, 0%% packet loss\n"
+                           "rtt min/avg/max/mdev = 1.0/%s/3.0/0.5 ms" % rtt, "")
+            return (1, "2 packets transmitted, 0 received, 100% packet loss", "")
+        return (0, "", "")
+    return _sh
+
+def probe_rows(ctx):
+    f = os.path.join(ctx.cfg.state_dir, "netprobe.jsonl")
+    try:
+        return [_pj.loads(l) for l in open(f).read().splitlines() if l.strip()]
+    except Exception:
+        return []
+
+def mkprobe(**over):
+    o = {"sh": sh_net(), "tcp_up": lambda *a, **k: True}
+    o.update(over)
+    ctx, rec = mkctx(**o)
+    ctx.cfg.probe_sample_s = 300
+    return ctx, rec
+
+DOWN_WAN = {"tcp_up": lambda *a, **k: False}
+
+# P1 healthy tick -> a telemetry sample, no outage records
+ctx, rec = mkprobe()
+NetProbeHealer().run(ctx)
+rows = probe_rows(ctx)
+check("P1 healthy -> one sample row", [r for r in rows if r["k"] == "s"])
+check("P1 healthy -> no outage rows", not [r for r in rows if r["k"] in ("down", "up")])
+check("P1 sample carries node id + timestamp",
+      rows and rows[0].get("n") and rows[0].get("t"))
+
+# P2 sample cadence is respected - a 60s tick must NOT write a sample every time
+ctx, rec = mkprobe()
+p = NetProbeHealer()
+p.run(ctx); p.run(ctx); p.run(ctx)
+check("P2 three ticks inside the window -> still ONE sample",
+      len([r for r in probe_rows(ctx) if r["k"] == "s"]) == 1)
+
+# P3 WAN drops -> a 'down' row, and the gateway state at that moment is captured
+ctx, rec = mkprobe(**DOWN_WAN)
+NetProbeHealer().run(ctx)
+d = [r for r in probe_rows(ctx) if r["k"] == "down"]
+check("P3 wan down -> 'down' row written", len(d) == 1)
+check("P3 down row records the gateway was reachable", d and d[0]["gw"] == 1)
+check("P3 down -> outage clock started", rec["saved"] and rec["saved"].get("down_since"))
+
+# ---- the discriminator: who was missing during the outage? ----------------
+def outage(gw, ticks=3, elapsed=180):
+    """Run `ticks` down-ticks with a given gateway state, then recover."""
+    sh = sh_net(ping=gw)
+    ctx, rec = mkprobe(sh=sh, **DOWN_WAN)
+    p = NetProbeHealer()
+    for _ in range(ticks):
+        p.run(ctx)
+    st = dict(rec["saved"] or {})
+    st["down_since"] = int(time.time()) - elapsed          # age the outage
+    ctx2, rec2 = mkprobe(sh=sh, state=st)                  # WAN back up
+    ctx2.cfg.state_dir = ctx.cfg.state_dir                 # same probe file
+    p.run(ctx2)
+    return ctx2, rec2
+
+# P4 gateway answered throughout -> the carrier was missing, not us
+ctx, rec = outage("up")
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("P4 gateway up throughout -> verdict 'carrier'", u and u[0]["v"] == "carrier")
+check("P4 outage duration recorded (~180s)", u and 170 <= u[0]["dur"] <= 190)
+check("P4 emits probe.wan-outage with the verdict",
+      any(c == "probe.wan-outage" and f.get("verdict") == "carrier" for c, f in rec["events"]))
+
+# P5 gateway gone too -> the fault was in our cabinet
+ctx, rec = outage("down")
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("P5 gateway down too -> verdict 'onsite'", u and u[0]["v"] == "onsite")
+
+# P6 gateway unmeasurable throughout -> 'unknown'; NEVER guessed onto a side
+ctx, rec = outage("missing")
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("P6 gateway unmeasurable -> verdict 'unknown' (not carrier, not onsite)",
+      u and u[0]["v"] == "unknown")
+check("P6 unmeasurable ticks counted separately from up/down",
+      u and u[0]["gw_unk"] >= 1 and u[0]["gw_up"] == 0 and u[0]["gw_down"] == 0)
+
+# ---- null vs zero: the discipline the 2026-08-03 report died for ----------
+
+# P7 an unreachable gateway is 0; an unMEASURABLE one is null. Never the same.
+ctx, _ = mkprobe(sh=sh_net(ping="down"))
+NetProbeHealer().run(ctx)
+r_down = [r for r in probe_rows(ctx) if r["k"] == "s"][0]
+ctx, _ = mkprobe(sh=sh_net(ping="missing"))
+NetProbeHealer().run(ctx)
+r_miss = [r for r in probe_rows(ctx) if r["k"] == "s"][0]
+check("P7 gateway unreachable -> gw == 0", r_down["gw"] == 0)
+check("P7 gateway unmeasurable -> gw is null (NOT 0)", r_miss["gw"] is None)
+
+# P8 no default route at all -> dev/gw null, and the row is still written
+ctx, _ = mkprobe(sh=sh_net(route=""))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P8 no route -> dev is null", r["dev"] is None)
+check("P8 no route -> still records the sample (silence is data too)", r["k"] == "s")
+
+# P9 an unreadable sensor is null, never 0
+h = NetProbeHealer()
+check("P9 missing thermal sensor -> null", h._temp() is None or isinstance(h._temp(), float))
+check("P9 counters for a nonexistent device -> null", h._counters("nosuchdev0") is None)
+check("P9 counters with no device name -> null", h._counters(None) is None)
+
+# P10 THE probe must never act. Not once, under any input.
+for opts in ({}, DOWN_WAN, {"sh": sh_net(ping="down")}, {"sh": sh_net(ping="missing")}):
+    o = dict(opts)
+    ctx, rec = mkprobe(**o)
+    NetProbeHealer().run(ctx)
+    if rec["restart"] or rec["escalate"] or rec["rate_hit"]:
+        check("P10 probe never remediates (%s)" % (list(opts) or "healthy"), False)
+        break
+else:
+    check("P10 probe never restarts / escalates / consumes quota", True)
+
+# P11 the probe writes to its OWN file, not the healer event stream
+ctx, rec = mkprobe()
+NetProbeHealer().run(ctx)
+check("P11 writes netprobe.jsonl", os.path.exists(os.path.join(ctx.cfg.state_dir, "netprobe.jsonl")))
+check("P11 does NOT write events.jsonl", not os.path.exists(os.path.join(ctx.cfg.state_dir, "events.jsonl")))
+
+# P12 an unwritable state dir must not break the tick (a probe is never load-bearing)
+ctx, rec = mkprobe()
+_ro = tempfile.mkdtemp(); _TMP.append(_ro)
+ctx.cfg.state_dir = os.path.join(_ro, "ro"); os.makedirs(ctx.cfg.state_dir); os.chmod(ctx.cfg.state_dir, 0o500)
+_raised = None
+try:
+    NetProbeHealer().run(ctx)
+except Exception as e:
+    _raised = e
+os.chmod(ctx.cfg.state_dir, 0o700)
+check("P12 unwritable state dir -> probe does NOT raise", _raised is None)
 
 # ===========================================================================
 # Event system (real emit / manifest / bundle) - the AI-diagnosis logging layer

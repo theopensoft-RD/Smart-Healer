@@ -1,6 +1,8 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 523 - self-update works on both fleet OS generations, and an
+Modular package (rev 524 - phase-1 network probe: outage duration + a
+carrier-vs-cabinet discriminator that needs no router credentials;
+rev 523 - self-update works on both fleet OS generations, and an
 unwritable state dir can no longer silence remediation; rev 522 - multi-brand camera
 repair + verified H.264 enforcement; rev 521 - uplink-aware IRIV Quectel EC25 4G
 recovery; rev 520 - structured events for AI diagnosis). Deployed as a single zipapp
@@ -28,4 +30,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "523"
+__version__ = "524"

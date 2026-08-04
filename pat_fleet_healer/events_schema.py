@@ -75,6 +75,11 @@ CODES = {
     "beszel.beszel-agent-restart-failed":        {"sev": "warn", "desc": "beszel-agent restart failed",
                       "cause": "unit/binary", "fix": "manual restart beszel-agent"},
 
+    # --- phase-1 network probe (measures, never remediates) ---
+    "probe.wan-outage": {"sev": "info", "desc": "a WAN outage ended: d.dur seconds, and d.verdict says who was missing (carrier = the LAN gateway answered throughout, so the fault was upstream; onsite = the gateway went too, so the fault was in the cabinet; mixed/unknown = cannot attribute)",
+                      "cause": "normal telemetry, not a fault report",
+                      "fix": "none - this is the record that lets a human separate 'the carrier failed' from 'our box failed'; detail rows are in netprobe.jsonl"},
+
     # --- connectivity (F10) — uplink-aware ---
     "connectivity.wan-down-detect-only": {"sev": "warn", "desc": "4G WAN down; robustel uplink -> detect+escalate only (Robustel self-reboots off-node; healer never reboots Robustel/netbird)",
                       "cause": "Robustel/4G uplink down", "fix": "Robustel emergency_reboot handles recovery; if persists, on-site check antenna/SIM"},
