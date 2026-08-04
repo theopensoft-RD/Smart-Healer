@@ -30,11 +30,13 @@ sample cadence would otherwise drown the healer's own event stream.
 import os
 import time
 import json
+import socket
 from .base import Healer
 from ..core.events import _rotate_if_big
 
 _S = "probe"
 PROBE_FILE = "netprobe.jsonl"
+UPTIME_FILE = "/proc/uptime"   # overridable so the contract is testable off-Linux
 
 
 class NetProbeHealer(Healer):
@@ -46,22 +48,55 @@ class NetProbeHealer(Healer):
         st = ctx.state_load(_S) or {}
         wan = bool(ctx.tcp_up("8.8.8.8", 53, 3) or ctx.tcp_up("1.1.1.1", 53, 3))
         dev, gw = self._route(ctx)
-        gw_ok, gw_rtt = self._ping(ctx, gw) if gw else (None, None)
+        # cheap 2-packet check every tick; the rich 5-packet one runs only in the sample
+        gw_ok = self._ping(ctx, gw, 2)[0] if gw else None
 
         if not wan:
             st = self._on_down(ctx, st, now, gw_ok)
         elif st.get("down_since"):
             st = self._on_recover(ctx, st, now, gw_ok)
 
-        # periodic telemetry, independent of the up/down machine
+        # The centre being unreachable while the internet is fine is its OWN failure
+        # class - it is the evidence for "everything relays through one point", which
+        # is the report's strongest architectural argument and its least-measured one.
+        cen_ok, cen_ms = self._centre(ctx)
+        st = self._track_centre(ctx, st, now, cen_ok, wan)
+
+        # periodic telemetry, independent of the up/down machines
         if now - int(st.get("sampled", 0)) >= ctx.cfg.probe_sample_s:
             st["sampled"] = now
-            self._write(ctx, {"k": "s", "wan": 1 if wan else 0,
-                              "gw": self._tri(gw_ok), "rtt_gw": gw_rtt,
-                              "rtt_net": self._ping(ctx, "8.8.8.8")[1],
-                              "temp": self._temp(), "dev": dev,
-                              **(self._counters(dev) or {"ctr": None})})
+            g_ok, g_rtt, g_jit, g_loss = self._ping(ctx, gw, 5) if gw else (None, None, None, None)
+            n_ok, n_rtt, n_jit, n_loss = self._ping(ctx, "8.8.8.8", 5)
+            row = {"k": "s", "wan": 1 if wan else 0,
+                   "gw": self._tri(g_ok), "rtt_gw": g_rtt,
+                   "rtt_net": n_rtt, "jit_net": n_jit, "loss_net": n_loss,
+                   "ctr": self._tri(cen_ok), "rtt_ctr": cen_ms,
+                   "up": self._uptime(), "ntp": self._tri(self._ntp(ctx)),
+                   "temp": self._temp(), "dev": dev,
+                   "disk": self._disk(ctx), "mem": self._mem(ctx)}
+            row.update(self._netbird(ctx))
+            row.update(self._counters(dev) or {"rx": None, "tx": None, "rxe": None,
+                                               "txe": None, "rxd": None, "txd": None})
+            self._write(ctx, row)
         ctx.state_save(_S, st)
+
+    def _track_centre(self, ctx, st, now, cen_ok, wan):
+        """Second, independent state machine: was the CENTRE reachable? Only counted
+        while the WAN itself was up - otherwise it just mirrors the WAN outage."""
+        if cen_ok is False and wan:
+            if not st.get("ctr_since"):
+                st["ctr_since"] = now
+                self._write(ctx, {"k": "ctr_down", "wan": 1})
+        elif st.get("ctr_since") and (cen_ok is not False or not wan):
+            # close on reachable OR unmeasurable. Leaving it open when the centre
+            # becomes unmeasurable would park the clock indefinitely and then report
+            # one absurd duration - "end" records whether the end was confirmed.
+            dur = now - int(st["ctr_since"])
+            self._write(ctx, {"k": "ctr_up", "dur": dur, "wan": 1 if wan else 0,
+                              "end": self._tri(cen_ok)})
+            ctx.event("probe.centre-unreachable", dur=dur)
+            st.pop("ctr_since", None)
+        return st
 
     # --- state machine ----------------------------------------------------
     def _on_down(self, ctx, st, now, gw_ok):
@@ -107,21 +142,143 @@ class NetProbeHealer(Healer):
         dev = f[f.index("dev") + 1] if "dev" in f else None
         return dev, gw
 
-    def _ping(self, ctx, host):
-        """(reachable, rtt_ms). (None, None) if ping itself could not run."""
+    def _ping(self, ctx, host, count=2):
+        """(reachable, avg_ms, jitter_ms, loss_pct). All None if ping could not run.
+        jitter is ping's own mdev - the number a QoS argument actually needs."""
         if not host:
-            return None, None
-        rc, out, _ = ctx.sh("ping -c2 -W2 -q %s 2>/dev/null" % host, 12)
+            return None, None, None, None
+        rc, out, _ = ctx.sh("ping -c%d -W2 -q %s 2>/dev/null" % (count, host), 8 + 2 * count)
         if "packet loss" not in out:
-            return None, None                      # ping unavailable/unparseable
+            return None, None, None, None          # ping unavailable/unparseable
         ok = "100% packet loss" not in out
-        rtt = None
+        avg = jit = loss = None
+        try:
+            loss = int(out.split("% packet loss")[0].rsplit(" ", 1)[1])
+        except Exception:
+            loss = None
         if "min/avg/max" in out:
             try:
-                rtt = round(float(out.rsplit("=", 1)[1].strip().split("/")[1]), 1)
+                parts = out.rsplit("=", 1)[1].strip().split()[0].split("/")
+                avg = round(float(parts[1]), 1)
+                jit = round(float(parts[3]), 1) if len(parts) > 3 else None
             except Exception:
-                rtt = None
-        return ok, rtt
+                avg = jit = None
+        return ok, avg, jit, loss
+
+    def _centre(self, ctx):
+        """TCP-connect to the central endpoint. ICMP is filtered on the way in, so
+        pinging it would always look dead; a TCP handshake is the honest test."""
+        target = getattr(ctx.cfg, "probe_centre", "") or ""
+        if ":" not in target:
+            return None, None
+        host, _, port = target.rpartition(":")
+        try:
+            port = int(port)
+        except Exception:
+            return None, None
+        t = time.time()
+        s = socket.socket()
+        s.settimeout(4)
+        try:
+            s.connect((host, port))
+            return True, round((time.time() - t) * 1000, 1)
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return False, None
+        except Exception:
+            return None, None                      # could not even try -> null
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _netbird(self, ctx):
+        """Relay/overlay health. Every field null when it cannot be read - a node
+        WITHOUT the overlay must never look like a node whose relays are DOWN.
+
+        Uses --json, not the human output: the text layout differs between the two
+        netbird versions in this fleet (0.70.5 on RPi5, 0.71.4 on IRIV).
+
+        Measured 2026-08-04: on the 0.71.4 nodes `netbird status` intermittently
+        blocks for longer than 12s - every invocation form, including with no
+        timeout wrapper at all - while 0.70.5 answers in ~200ms. Cause not
+        established, so it is bounded rather than worked around: 5s, then null.
+        Null is the honest answer here; a fabricated zero would read as "the relays
+        are down", which is the opposite of what we know.
+        """
+        blank = {"nb_mgmt": None, "nb_sig": None, "nb_relay_up": None,
+                 "nb_relay_tot": None, "nb_peer_up": None, "nb_peer_tot": None}
+        rc, out, _ = ctx.sh("timeout 5 netbird status --json 2>/dev/null", 9)
+        if rc != 0 or not out.strip():
+            return blank
+        try:
+            d = json.loads(out)
+        except Exception:
+            return blank
+        o = dict(blank)
+        o["nb_mgmt"] = self._tri(self._dig(d, "management", "connected"))
+        o["nb_sig"] = self._tri(self._dig(d, "signal", "connected"))
+        o["nb_relay_up"] = self._int(self._dig(d, "relays", "available"))
+        o["nb_relay_tot"] = self._int(self._dig(d, "relays", "total"))
+        o["nb_peer_up"] = self._int(self._dig(d, "peers", "connected"))
+        o["nb_peer_tot"] = self._int(self._dig(d, "peers", "total"))
+        return o
+
+    @staticmethod
+    def _dig(d, *path):
+        """Fetch a nested key. Missing -> None (never a default value)."""
+        for k in path:
+            if not isinstance(d, dict) or k not in d:
+                return None
+            d = d[k]
+        return d
+
+    @staticmethod
+    def _int(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def _uptime(self):
+        """Seconds since boot. Lets analysis tell a REBOOT apart from a network
+        outage - today those are indistinguishable in the data."""
+        try:
+            with open(UPTIME_FILE) as f:
+                return int(float(f.read().split()[0]))
+        except Exception:
+            return None
+
+    def _ntp(self, ctx):
+        """Clock synced? Phase 2 asks 'did these nodes fail at the same moment' -
+        that question is meaningless if the clocks disagree."""
+        rc, out, _ = ctx.sh("timedatectl show -p NTPSynchronized --value 2>/dev/null", 8)
+        v = out.strip().lower()
+        if v in ("yes", "true", "1"):
+            return True
+        if v in ("no", "false", "0"):
+            return False
+        return None
+
+    def _disk(self, ctx):
+        rc, out, _ = ctx.sh("df -P / 2>/dev/null | tail -1", 8)
+        for tok in out.split():
+            if tok.endswith("%") and tok[:-1].isdigit():
+                return int(tok[:-1])
+        return None
+
+    def _mem(self, ctx):
+        """Percent of RAM in use."""
+        try:
+            tot = avail = None
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        tot = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1])
+            if tot and avail is not None:
+                return int(round((tot - avail) * 100.0 / tot))
+        except Exception:
+            pass
+        return None
 
     def _temp(self):
         try:

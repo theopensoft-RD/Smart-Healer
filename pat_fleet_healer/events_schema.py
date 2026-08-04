@@ -80,6 +80,10 @@ CODES = {
                       "cause": "normal telemetry, not a fault report",
                       "fix": "none - this is the record that lets a human separate 'the carrier failed' from 'our box failed'; detail rows are in netprobe.jsonl"},
 
+    "probe.centre-unreachable": {"sev": "info", "desc": "the internet was fine but the CENTRE was not reachable for d.dur seconds - a failure class distinct from a WAN outage",
+                      "cause": "relay/overlay, central ingest, or upstream of the datacentre",
+                      "fix": "none - this is the measurement that shows how often 'everything relays through one point' actually bites"},
+
     # --- connectivity (F10) — uplink-aware ---
     "connectivity.wan-down-detect-only": {"sev": "warn", "desc": "4G WAN down; robustel uplink -> detect+escalate only (Robustel self-reboots off-node; healer never reboots Robustel/netbird)",
                       "cause": "Robustel/4G uplink down", "fix": "Robustel emergency_reboot handles recovery; if persists, on-site check antenna/SIM"},

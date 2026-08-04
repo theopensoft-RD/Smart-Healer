@@ -48,6 +48,10 @@ class Config:
         # phase-1 network probe: outage duration + carrier-vs-onsite discriminator.
         # Transitions are recorded every tick; this is only the telemetry cadence.
         self.probe_sample_s = int(o.get("PROBE_SAMPLE_S", "300"))
+        # TCP endpoint that stands for "the centre". ICMP is filtered inbound, so a
+        # handshake is the only honest reachability test. 8883 not 1883: plain MQTT
+        # is closed fleet-wide (verified 2026-08-04) - see the note in core/events.
+        self.probe_centre = o.get("PROBE_CENTRE", "mqtt.pattaya-smart-sanitary.com:8883")
 
         # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
         self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)

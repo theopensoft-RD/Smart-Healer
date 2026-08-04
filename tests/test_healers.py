@@ -637,19 +637,35 @@ os.chmod(_ro.state_dir, 0o700)                   # let the temp cleanup remove i
 # invalidated the 2026-08-03 fleet report.
 # ===========================================================================
 import json as _pj
+import socket
 
-def sh_net(route="default via 192.168.1.1 dev eth0 proto dhcp", ping="up", rtt="2.1"):
-    """Stub `ip route` + `ping`. ping: 'up' | 'down' | 'missing' (command absent)."""
+def nb_json(mgmt=True, sig=True, r_up=2, r_tot=2, p_up=65, p_tot=75):
+    import json as _j
+    return _j.dumps({"management": {"connected": mgmt}, "signal": {"connected": sig},
+                     "relays": {"available": r_up, "total": r_tot},
+                     "peers": {"connected": p_up, "total": p_tot}})
+NB_OK = nb_json()
+
+def sh_net(route="default via 192.168.1.1 dev eth0 proto dhcp", ping="up", rtt="2.1",
+           nb=NB_OK, ntp="yes", disk="/dev/root 30G 7G 22G 24% /", mdev="0.5"):
+    """Stub the shell surface the probe touches. ping: 'up'|'down'|'missing'."""
     def _sh(c, timeout=15):
         if "ip route" in c:
             return (0, route, "")
         if c.startswith("ping"):
             if ping == "missing":
                 return (127, "", "ping: command not found")
+            n = 5 if "-c5" in c else 2
             if ping == "up":
-                return (0, "2 packets transmitted, 2 received, 0%% packet loss\n"
-                           "rtt min/avg/max/mdev = 1.0/%s/3.0/0.5 ms" % rtt, "")
-            return (1, "2 packets transmitted, 0 received, 100% packet loss", "")
+                return (0, "%d packets transmitted, %d received, 0%% packet loss\n"
+                           "rtt min/avg/max/mdev = 1.0/%s/3.0/%s ms" % (n, n, rtt, mdev), "")
+            return (1, "%d packets transmitted, 0 received, 100%% packet loss" % n, "")
+        if "netbird status" in c:
+            return ((0, nb, "") if nb else (127, "", "not found"))
+        if "timedatectl" in c:
+            return (0, ntp, "")
+        if c.startswith("df "):
+            return (0, disk, "")
         return (0, "", "")
     return _sh
 
@@ -660,12 +676,18 @@ def probe_rows(ctx):
     except Exception:
         return []
 
-def mkprobe(**over):
+def mkprobe(centre="", **over):
     o = {"sh": sh_net(), "tcp_up": lambda *a, **k: True}
     o.update(over)
     ctx, rec = mkctx(**o)
     ctx.cfg.probe_sample_s = 300
+    # default OFF: a unit test must never reach the real internet, and an
+    # unconfigured centre is itself the "not measured" case we want to assert
+    ctx.cfg.probe_centre = centre
     return ctx, rec
+
+def free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 DOWN_WAN = {"tcp_up": lambda *a, **k: False}
 
@@ -770,6 +792,152 @@ ctx, rec = mkprobe()
 NetProbeHealer().run(ctx)
 check("P11 writes netprobe.jsonl", os.path.exists(os.path.join(ctx.cfg.state_dir, "netprobe.jsonl")))
 check("P11 does NOT write events.jsonl", not os.path.exists(os.path.join(ctx.cfg.state_dir, "events.jsonl")))
+
+# ---- v525 additions: relay health, the centre, reboot vs outage, jitter -----
+
+# P13 netbird parsed: relays and peers as measured fractions
+ctx, _ = mkprobe()
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P13 netbird management/signal parsed", r["nb_mgmt"] == 1 and r["nb_sig"] == 1)
+check("P13 relays parsed as 2/2", (r["nb_relay_up"], r["nb_relay_tot"]) == (2, 2))
+check("P13 peers parsed as 65/75", (r["nb_peer_up"], r["nb_peer_tot"]) == (65, 75))
+
+# P14 no netbird CLI -> every nb_* is null. A node WITHOUT the overlay must never
+# look like a node whose relays are DOWN.
+ctx, _ = mkprobe(sh=sh_net(nb=""))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P14 no netbird -> nb_* all null (NOT 0)",
+      all(r[k] is None for k in ("nb_mgmt", "nb_sig", "nb_relay_up", "nb_peer_up")))
+
+# P15 relays genuinely down -> 0, which must be distinct from P14's null
+ctx, _ = mkprobe(sh=sh_net(nb=nb_json(r_up=0, r_tot=2, p_up=0)))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P15 relays down -> 0 (measured), not null", r["nb_relay_up"] == 0 and r["nb_relay_tot"] == 2)
+
+# P15b netbird IS there but a line is malformed -> that FIELD is null, while the
+# fields that DID parse stay real. Partial data must not become fake zeros.
+ctx, _ = mkprobe(sh=sh_net(nb='{"management":{"connected":true},"signal":{"connected":true},'
+                                     '"relays":{"note":"unavailable"},"peers":{"connected":65,"total":75}}'))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P15b unparseable relays line -> nb_relay_* null (NOT 0)",
+      r["nb_relay_up"] is None and r["nb_relay_tot"] is None)
+check("P15b the fields that parsed are still real", r["nb_mgmt"] == 1 and r["nb_peer_up"] == 65)
+
+# P16 the centre: reachable / refused / not configured
+_p = free_port()
+_srv = socket.socket(); _srv.bind(("127.0.0.1", _p)); _srv.listen(1)
+ctx, _ = mkprobe(centre="127.0.0.1:%d" % _p)
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P16 centre reachable -> ctr=1 with a latency", r["ctr"] == 1 and r["rtt_ctr"] is not None)
+_srv.close()
+ctx, _ = mkprobe(centre="127.0.0.1:%d" % free_port())
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P16 centre refused -> ctr=0", r["ctr"] == 0)
+ctx, _ = mkprobe(centre="")
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P16 centre not configured -> ctr null (NOT 0)", r["ctr"] is None)
+
+# P17 internet fine but centre gone = its own outage class, with its own duration
+_dead = "127.0.0.1:%d" % free_port()
+ctx, rec = mkprobe(centre=_dead)
+NetProbeHealer().run(ctx)
+check("P17 centre down while wan up -> 'ctr_down' row",
+      [x for x in probe_rows(ctx) if x["k"] == "ctr_down"])
+st = dict(rec["saved"] or {}); st["ctr_since"] = int(time.time()) - 90
+_p2 = free_port()
+_srv2 = socket.socket(); _srv2.bind(("127.0.0.1", _p2)); _srv2.listen(1)
+ctx2, rec2 = mkprobe(centre="127.0.0.1:%d" % _p2)     # centre answering again
+ctx2.cfg.state_dir = ctx.cfg.state_dir
+ctx2._svc["state_load"] = lambda n: dict(st)
+NetProbeHealer().run(ctx2)
+_srv2.close()
+u = [x for x in probe_rows(ctx2) if x["k"] == "ctr_up"]
+check("P17 centre back -> 'ctr_up' row with duration", u and 80 <= u[0]["dur"] <= 100)
+check("P17 the end was confirmed, not assumed", u and u[0]["end"] == 1)
+check("P17 emits probe.centre-unreachable",
+      any(c == "probe.centre-unreachable" for c, _ in rec2["events"]))
+
+# P17b centre becomes UNMEASURABLE mid-outage -> close it, and say the end is unknown.
+# Leaving it open would park the clock and later report one absurd duration.
+st2 = {"ctr_since": int(time.time()) - 45}
+ctx3, rec3 = mkprobe(centre="")
+ctx3._svc["state_load"] = lambda n: dict(st2)
+NetProbeHealer().run(ctx3)
+u = [x for x in probe_rows(ctx3) if x["k"] == "ctr_up"]
+check("P17b unmeasurable centre -> outage closed, end recorded as null",
+      u and u[0]["end"] is None and 35 <= u[0]["dur"] <= 55)
+
+# P18 if the WAN is down too, that is NOT a centre outage - it is the WAN outage.
+# Counting it twice would inflate the very argument this data is meant to test.
+ctx, rec = mkprobe(centre=_dead, **DOWN_WAN)
+NetProbeHealer().run(ctx)
+check("P18 wan down -> no 'ctr_down' (not double-counted)",
+      not [x for x in probe_rows(ctx) if x["k"] == "ctr_down"])
+
+# P19 uptime -> separates a reboot from a network outage
+ctx, _ = mkprobe()
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P19 uptime recorded", r["up"] is None or (isinstance(r["up"], int) and r["up"] > 0))
+import pat_fleet_healer.healers.net_probe as _np
+_uf = tempfile.mkstemp()[1]; open(_uf, "w").write("7289753.12 1234.5\n")
+_orig_uf = _np.UPTIME_FILE; _np.UPTIME_FILE = _uf
+check("P19 uptime parsed from the real file format", NetProbeHealer()._uptime() == 7289753)
+_np.UPTIME_FILE = os.path.join(_uf, "nope")
+check("P19 unreadable uptime -> null (NOT 0)", NetProbeHealer()._uptime() is None)
+_np.UPTIME_FILE = _orig_uf; os.unlink(_uf)
+
+# P20 clock sync is tri-state, never assumed
+for val, want, label in (("yes", 1, "synced"), ("no", 0, "not synced"), ("", None, "unknown")):
+    ctx, _ = mkprobe(sh=sh_net(ntp=val))
+    NetProbeHealer().run(ctx)
+    r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+    check("P20 ntp %s -> %s" % (label, want), r["ntp"] == want)
+
+# P21 jitter + loss come from the 5-packet sample, not the cheap per-tick check
+ctx, _ = mkprobe(sh=sh_net(rtt="27.5", mdev="6.1"))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P21 jitter (mdev) recorded", r["jit_net"] == 6.1)
+check("P21 loss percent recorded as 0 (measured)", r["loss_net"] == 0)
+ctx, _ = mkprobe(sh=sh_net(ping="down"))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P21 total loss -> 100 (measured), rtt null (nothing came back)",
+      r["loss_net"] == 100 and r["rtt_net"] is None)
+
+# P22 disk + memory
+ctx, _ = mkprobe()
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P22 disk percent parsed", r["disk"] == 24)
+check("P22 memory percent is a sane 0-100 or null",
+      r["mem"] is None or 0 <= r["mem"] <= 100)
+# P22b df says something we cannot parse -> null. A 0 here would read as
+# "disk completely empty", which is the most dangerous possible wrong answer.
+ctx, _ = mkprobe(sh=sh_net(disk="df: /: Operation not permitted"))
+NetProbeHealer().run(ctx)
+r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
+check("P22b unparseable df -> disk null (NOT 0)", r["disk"] is None)
+
+# P23 the per-tick gateway check stays cheap; only the sample pays for 5 packets
+_seen = []
+def sh_count(c, timeout=15):
+    if c.startswith("ping"):
+        _seen.append("-c5" if "-c5" in c else "-c2")
+    return sh_net()(c, timeout)
+ctx, _ = mkprobe(sh=sh_count)
+p = NetProbeHealer()
+p.run(ctx); _seen[:] = []; p.run(ctx)      # 2nd tick is inside the sample window
+check("P23 a non-sampling tick uses only the cheap 2-packet check",
+      _seen and all(x == "-c2" for x in _seen))
 
 # P12 an unwritable state dir must not break the tick (a probe is never load-bearing)
 ctx, rec = mkprobe()

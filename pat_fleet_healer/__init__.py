@@ -1,6 +1,9 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 524 - phase-1 network probe: outage duration + a
+Modular package (rev 525 - probe also records relay/overlay health, whether the
+CENTRE was reachable while the internet was fine, node uptime (reboot vs outage),
+jitter/loss, clock sync, disk and memory;
+rev 524 - phase-1 network probe: outage duration + a
 carrier-vs-cabinet discriminator that needs no router credentials;
 rev 523 - self-update works on both fleet OS generations, and an
 unwritable state dir can no longer silence remediation; rev 522 - multi-brand camera
@@ -30,4 +33,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "524"
+__version__ = "525"
