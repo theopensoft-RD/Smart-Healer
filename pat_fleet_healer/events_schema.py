@@ -80,6 +80,10 @@ CODES = {
                       "cause": "normal telemetry, not a fault report",
                       "fix": "none - but WEIGHT it by d.gwk: on a 'modem' node an answering gateway only proves the module is enumerated on USB, not that the cellular network was at fault, so those outages are reported 'unknown' and must NOT be pooled with 'carrier' ones. Detail rows are in netprobe.jsonl"},
 
+    "probe.stream-session-lost": {"sev": "info", "desc": "the RTMP session to the centre was down for d.dur seconds. d.verdict says what the INTERNET was doing meanwhile: net-ok = the internet was reachable for the whole outage, so the mobile network did NOT cause it and the fault is in the streaming path; wan = the internet was gone too; mixed/unknown = cannot attribute. d.wan_up / d.wan_down are the tick tallies behind the verdict",
+                      "cause": "normal telemetry, not a fault report",
+                      "fix": "none - this is the record that decides whether a stream drop belongs to the carrier at all. A run of net-ok verdicts means the drops are ours to fix, not the network's. Only recorded while pat-smart-stream is active; a stopped service reports nothing rather than a false outage"},
+
     "probe.centre-unreachable": {"sev": "info", "desc": "the internet was fine but the CENTRE was not reachable for d.dur seconds - a failure class distinct from a WAN outage",
                       "cause": "relay/overlay, central ingest, or upstream of the datacentre",
                       "fix": "none - this is the measurement that shows how often 'everything relays through one point' actually bites"},

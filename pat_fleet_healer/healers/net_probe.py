@@ -62,6 +62,11 @@ class NetProbeHealer(Healer):
         cen_ok, cen_ms = self._centre(ctx)
         st = self._track_centre(ctx, st, now, cen_ok, wan)
 
+        # Is the node's stream session to the centre actually established, and if not,
+        # was the internet up at that moment? Recorded on the SAME row so the question
+        # never has to be answered by lining up two logs by hand.
+        st, push_n = self._track_push(ctx, st, now, wan)
+
         # periodic telemetry, independent of the up/down machines
         if now - int(st.get("sampled", 0)) >= ctx.cfg.probe_sample_s:
             st["sampled"] = now
@@ -71,6 +76,7 @@ class NetProbeHealer(Healer):
                    "gw": self._tri(g_ok), "rtt_gw": g_rtt,
                    "rtt_net": n_rtt, "jit_net": n_jit, "loss_net": n_loss,
                    "ctr": self._tri(cen_ok), "rtt_ctr": cen_ms,
+                   "push": push_n,
                    "up": self._uptime(), "ntp": self._tri(self._ntp(ctx)),
                    "temp": self._temp(), "dev": dev,
                    "disk": self._disk(ctx), "mem": self._mem(ctx)}
@@ -97,6 +103,62 @@ class NetProbeHealer(Healer):
             ctx.event("probe.centre-unreachable", dur=dur)
             st.pop("ctr_since", None)
         return st
+
+    def _track_push(self, ctx, st, now, wan):
+        """Track the RTMP session to the centre, and WHAT THE INTERNET WAS DOING while
+        it was down.
+
+        WHY THIS EXISTS. The node keeps two separate records: the healer's stream logs
+        say "the stream broke", and this probe says "the internet went away". Deciding
+        whether a given stream break belongs to the mobile network meant lining the two
+        up by hand, which is guesswork at 60-second resolution. Recording both facts in
+        ONE row makes the question answerable directly:
+            v="net-ok" -> the internet was reachable for the WHOLE outage, so the
+                          mobile network did NOT cause it - the fault is in the
+                          streaming path (session, ingest, pipeline).
+            v="wan"    -> the internet was gone too.
+        That distinction is the difference between an argument about the carrier and an
+        argument about our own software.
+
+        Only tracked while the stream service is ACTIVE. A stopped service is not
+        pushing on purpose, and counting that as an outage would fabricate a fault -
+        the PISN signage nodes would otherwise report a permanent stream outage.
+        Returns (state, established-count-or-None); None means "not measured".
+        """
+        if not ctx.svc_active("pat-smart-stream"):
+            for k in ("push_since", "pw_up", "pw_down"):
+                st.pop(k, None)
+            return st, None                       # not measured, NOT zero
+
+        n = ctx.estab_1935()
+        if not n:
+            if not st.get("push_since"):
+                st.update({"push_since": now, "pw_up": 0, "pw_down": 0})
+                self._write(ctx, {"k": "push_down", "wan": 1 if wan else 0})
+            key = "pw_up" if wan else "pw_down"
+            st[key] = int(st.get(key, 0)) + 1
+        elif st.get("push_since"):
+            dur = now - int(st["push_since"])
+            up, down = int(st.get("pw_up", 0)), int(st.get("pw_down", 0))
+            verdict = self._push_verdict(up, down)
+            self._write(ctx, {"k": "push_up", "dur": dur, "wan_up": up,
+                              "wan_down": down, "v": verdict})
+            ctx.event("probe.stream-session-lost", dur=dur, verdict=verdict,
+                      wan_up=up, wan_down=down)
+            for k in ("push_since", "pw_up", "pw_down"):
+                st.pop(k, None)
+        return st, n
+
+    @staticmethod
+    def _push_verdict(wan_up, wan_down):
+        """Who was missing while the stream session was down. Never guessed."""
+        if wan_up and not wan_down:
+            return "net-ok"     # internet fine throughout -> NOT the mobile network
+        if wan_down and not wan_up:
+            return "wan"        # the internet was gone too
+        if wan_up and wan_down:
+            return "mixed"
+        return "unknown"
 
     # --- state machine ----------------------------------------------------
     def _on_down(self, ctx, st, now, gw_ok, dev=None):

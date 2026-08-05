@@ -1092,6 +1092,119 @@ u = [r for r in probe_rows(ctx) if r["k"] == "up"]
 check("G12 interface changed mid-outage -> no side claimed",
       u and u[0]["v"] == "unknown" and u[0].get("gwk") is None)
 
+
+# ---------------------------------------------------------------------------
+# K1-K14  the stream session vs the internet, recorded on ONE row.
+# The question this closes: when a stream to the centre drops, was the mobile
+# network actually gone, or was the internet fine and the session broke anyway?
+# Measured 5 Aug over 11.5h: 7 internet outages (all one node) vs 9 stream breaks
+# (three OTHER nodes) with ZERO overlap - which, if it holds, means the drops are
+# not the carrier's. That claim is too load-bearing to rest on lining up two logs
+# by hand at 60s resolution, so the probe now records both facts together.
+# ---------------------------------------------------------------------------
+check("K1 internet up throughout -> 'net-ok' (NOT the mobile network)",
+      NetProbeHealer._push_verdict(5, 0) == "net-ok")
+check("K1 internet gone throughout -> 'wan'", NetProbeHealer._push_verdict(0, 5) == "wan")
+check("K1 both -> 'mixed'", NetProbeHealer._push_verdict(3, 2) == "mixed")
+check("K1 nothing observed -> 'unknown', never a guess",
+      NetProbeHealer._push_verdict(0, 0) == "unknown")
+
+def pushctx(estab, active=True, wan=True, state=None):
+    o = {"estab_1935": (lambda: estab), "svc_active": (lambda s: active),
+         "tcp_up": (lambda *a, **k: wan)}
+    ctx, rec = mkprobe(state=state, **o)
+    return ctx, rec
+
+# service running but nothing established = a real stream outage
+ctx, rec = pushctx(0)
+NetProbeHealer().run(ctx)
+d = [r for r in probe_rows(ctx) if r["k"] == "push_down"]
+check("K2 stream service up but no session -> push_down row", len(d) == 1)
+check("K2 push_down records what the internet was doing", d and d[0].get("wan") == 1)
+
+# a session that is established writes nothing
+ctx, rec = pushctx(2)
+NetProbeHealer().run(ctx)
+check("K3 an established session writes no outage row",
+      not [r for r in probe_rows(ctx) if r["k"] in ("push_down", "push_up")])
+
+# the decisive case: internet reachable for the WHOLE stream outage
+def push_outage(wan_seq, elapsed=120):
+    """Run down-ticks with a given internet state, then let the session return."""
+    ctx, rec = pushctx(0, wan=wan_seq[0])
+    p = NetProbeHealer()
+    p.run(ctx)
+    st = dict(rec["saved"] or {})
+    for w in wan_seq[1:]:
+        ctx2, rec2 = pushctx(0, wan=w, state=st)
+        ctx2.cfg.state_dir = ctx.cfg.state_dir
+        p.run(ctx2); st = dict(rec2["saved"] or {})
+    st["push_since"] = int(time.time()) - elapsed
+    ctx3, rec3 = pushctx(1, wan=True, state=st)      # session back
+    ctx3.cfg.state_dir = ctx.cfg.state_dir
+    p.run(ctx3)
+    return ctx3, rec3
+
+ctx, rec = push_outage([True, True, True])
+u = [r for r in probe_rows(ctx) if r["k"] == "push_up"]
+check("K4 internet fine throughout the stream outage -> verdict 'net-ok'",
+      u and u[-1]["v"] == "net-ok")
+check("K4 duration recorded (~120s)", u and 110 <= u[-1]["dur"] <= 130)
+check("K4 tallies kept: wan_up>0 and wan_down==0",
+      u and u[-1]["wan_up"] >= 1 and u[-1]["wan_down"] == 0)
+check("K5 emits probe.stream-session-lost carrying the verdict",
+      any(c == "probe.stream-session-lost" and f.get("verdict") == "net-ok"
+          for c, f in rec["events"]))
+
+ctx, rec = push_outage([False, False])
+u = [r for r in probe_rows(ctx) if r["k"] == "push_up"]
+check("K6 internet gone too -> verdict 'wan'", u and u[-1]["v"] == "wan")
+
+ctx, rec = push_outage([True, False, True])
+u = [r for r in probe_rows(ctx) if r["k"] == "push_up"]
+check("K7 internet flapped during the outage -> 'mixed', no side claimed",
+      u and u[-1]["v"] == "mixed")
+
+# a STOPPED service is not an outage - the PISN signage nodes would otherwise
+# report a permanent stream failure
+ctx, rec = pushctx(0, active=False)
+NetProbeHealer().run(ctx)
+check("K8 stopped stream service writes NO outage row (not pushing on purpose)",
+      not [r for r in probe_rows(ctx) if r["k"] in ("push_down", "push_up")])
+
+# null vs zero, again: the field that says how many sessions are up
+ctx, rec = pushctx(3)
+NetProbeHealer().run(ctx)
+srow = [r for r in probe_rows(ctx) if r["k"] == "s"]
+check("K9 sample carries the session count", srow and srow[0].get("push") == 3)
+ctx, rec = pushctx(0, active=False)
+NetProbeHealer().run(ctx)
+srow = [r for r in probe_rows(ctx) if r["k"] == "s"]
+check("K10 service not running -> push is null, NOT 0",
+      srow and "push" in srow[0] and srow[0]["push"] is None)
+
+# a service that stops mid-outage must not leave the episode open forever
+ctx, rec = pushctx(0)
+NetProbeHealer().run(ctx)
+st = dict(rec["saved"] or {})
+check("K11 an open stream outage is recorded in state", st.get("push_since"))
+ctx2, rec2 = pushctx(0, active=False, state=st)
+ctx2.cfg.state_dir = ctx.cfg.state_dir
+NetProbeHealer().run(ctx2)
+check("K11 stopping the service clears the open outage instead of stranding it",
+      not (rec2["saved"] or {}).get("push_since"))
+
+# the stream machine must not disturb the WAN machine
+ctx, rec = pushctx(0, wan=False)
+NetProbeHealer().run(ctx)
+rows = probe_rows(ctx)
+check("K12 a stream outage does not suppress the WAN outage record",
+      [r for r in rows if r["k"] == "down"] and [r for r in rows if r["k"] == "push_down"])
+check("K13 the probe still never remediates", rec["restart"] == [] and rec["escalate"] == [])
+check("K14 code is documented in the manifest",
+      "probe.stream-session-lost" in __import__("pat_fleet_healer.events_schema",
+                                                fromlist=["CODES"]).CODES)
+
 # ---------------------------------------------------------------------------
 # M1-M25  central push (MQTT).  The bug being closed: events.py hardcoded port
 # 1883, which is CLOSED on this fleet's broker, inside a bare `except: pass`.
