@@ -126,11 +126,15 @@ def escalate(healer, verdict, ev=None):
                           "evidence": ev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ")},
                          ensure_ascii=False)
     # publish to central (best-effort; the log line above is the record of truth).
-    # paho ships in the pat-smart venv (radar uses it); mosquitto_pub is not installed.
+    # LEGACY FILE: the deployed artifact is healer.pyz, built from pat_fleet_healer/.
+    # This monolith is kept only because install-healer.sh still points a node's
+    # ExecStart at it - so its port must not be allowed to disagree. 8883 not 1883:
+    # 1883 is closed fleet-wide and 8883 serves plain MQTT (measured 2026-08-05).
     try:
         import paho.mqtt.publish as publish
         publish.single("healer/%s/escalate" % DEVICE_ID, payload=payload,
-                       hostname=MQTT_HOST, port=1883, keepalive=10)
+                       hostname=MQTT_HOST, port=int(os.getenv("MQTT_PORT") or 8883),
+                       keepalive=10)
     except Exception as e:
         log("escalate-publish-skip (%r) - logged only" % e)
 

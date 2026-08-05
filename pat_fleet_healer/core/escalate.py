@@ -1,8 +1,9 @@
 """Escalation: the log line is the record of truth; MQTT publish to central is
-best-effort (paho ships in the pat-smart venv; mosquitto_pub is not installed)."""
+best-effort (core.mqtt carries its own client - paho is absent on the PISN nodes)."""
 import json
 import time
 from .log import log
+from . import mqtt
 
 
 def escalate(cfg, healer, verdict, ev=None):
@@ -11,9 +12,7 @@ def escalate(cfg, healer, verdict, ev=None):
     payload = json.dumps({"device_id": cfg.device_id, "healer": healer, "verdict": verdict,
                           "evidence": ev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ")},
                          ensure_ascii=False)
-    try:
-        import paho.mqtt.publish as publish
-        publish.single("healer/%s/escalate" % cfg.device_id, payload=payload,
-                       hostname=cfg.mqtt_host, port=1883, keepalive=10)
-    except Exception as e:
-        log(cfg, "escalate-publish-skip (%r) - logged only" % e)
+    if not mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
+                        "healer/%s/escalate" % cfg.device_id, payload, cfg.node_id):
+        log(cfg, "escalate-publish-failed (%s:%s) - logged only"
+                 % (cfg.mqtt_host, cfg.mqtt_port))

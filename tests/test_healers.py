@@ -1024,6 +1024,207 @@ check("E6 bundle manifest decodes codes", "radar.sensor-moved" in _b["manifest"]
 check("E6 bundle redacts secrets", "hunter2" not in gzip.open(_out).read().decode())
 check("E6 bundle compresses", _comp <= _raw)
 
+
+# ---------------------------------------------------------------------------
+# M1-M25  central push (MQTT).  The bug being closed: events.py hardcoded port
+# 1883, which is CLOSED on this fleet's broker, inside a bare `except: pass`.
+# Result: the centre received ZERO healer events for months and nothing said so.
+# Two failures had to be fixed together - the wrong port, and the silence.
+# The protocol tests run against a REAL socket server speaking real bytes, so
+# they test the wire format, not a mock of our own assumptions.
+# ---------------------------------------------------------------------------
+import json as _json
+import socket as _socket
+import threading as _threading
+from pat_fleet_healer.core import mqtt as _mqtt
+from pat_fleet_healer.core import events as _events
+from pat_fleet_healer.core import escalate as _escalate
+
+
+class FakeBroker(object):
+    """A socket server that speaks just enough MQTT to be answered honestly."""
+
+    def __init__(self, connack_rc=0, mode="normal"):
+        self.rc, self.mode = connack_rc, mode
+        self.connect_pkt = b""
+        self.publish_pkt = b""
+        self.srv = _socket.socket()
+        self.srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self.t = _threading.Thread(target=self._run)
+        self.t.daemon = True
+        self.t.start()
+
+    def _run(self):
+        try:
+            self.srv.settimeout(5)
+            c, _ = self.srv.accept()
+            c.settimeout(5)
+            if self.mode == "hangup":
+                c.close(); return
+            self.connect_pkt = c.recv(4096)
+            if self.mode == "garbage":
+                c.sendall(b"\x99\x02\x00\x00")
+            else:
+                c.sendall(bytes(bytearray([0x20, 0x02, 0x00, self.rc])))
+            if self.rc == 0:
+                self.publish_pkt = c.recv(65536)
+            c.close()
+        except Exception:
+            pass
+        finally:
+            try: self.srv.close()
+            except Exception: pass
+
+    def join(self):
+        self.t.join(6)
+
+
+# ---- wire format ----------------------------------------------------------
+check("M1 remaining-length 0", _mqtt._remaining_length(0) == b"\x00")
+check("M1 remaining-length 127", _mqtt._remaining_length(127) == b"\x7f")
+check("M1 remaining-length 128 (2-byte)", _mqtt._remaining_length(128) == b"\x80\x01")
+check("M1 remaining-length 16383", _mqtt._remaining_length(16383) == b"\xff\x7f")
+check("M1 remaining-length 16384 (3-byte)", _mqtt._remaining_length(16384) == b"\x80\x80\x01")
+
+_b = FakeBroker()
+_ok = _mqtt.publish("127.0.0.1", _b.port, "fleet/events/N1", "hello", "N1")
+_b.join()
+check("M2 accepted publish returns True", _ok is True)
+check("M3 CONNECT starts with 0x10", _b.connect_pkt[:1] == b"\x10")
+check("M3 CONNECT names protocol MQTT", b"MQTT" in _b.connect_pkt[:12])
+check("M3 CONNECT is protocol level 4", _b.connect_pkt[8:9] == b"\x04")
+check("M3 CONNECT sets clean-session", _b.connect_pkt[9:10] == b"\x02")
+check("M3 CONNECT carries the client id", b"N1" in _b.connect_pkt)
+check("M4 PUBLISH starts with 0x30 (QoS 0)", _b.publish_pkt[:1] == b"\x30")
+check("M4 PUBLISH carries the topic", b"fleet/events/N1" in _b.publish_pkt)
+check("M4 PUBLISH carries the payload", b"hello" in _b.publish_pkt)
+check("M4 DISCONNECT follows the publish", _b.publish_pkt.endswith(b"\xe0\x00"))
+
+_b = FakeBroker(connack_rc=5)                     # 5 = not authorised
+_ok = _mqtt.publish("127.0.0.1", _b.port, "t", "x", "N1"); _b.join()
+check("M5 refused CONNACK is NOT reported as sent", _ok is False)
+
+_b = FakeBroker(mode="hangup")
+_ok = _mqtt.publish("127.0.0.1", _b.port, "t", "x", "N1"); _b.join()
+check("M6 broker hangs up -> False", _ok is False)
+
+_b = FakeBroker(mode="garbage")
+_ok = _mqtt.publish("127.0.0.1", _b.port, "t", "x", "N1"); _b.join()
+check("M11 non-CONNACK reply -> False", _ok is False)
+
+_s = _socket.socket(); _s.bind(("127.0.0.1", 0)); _dead = _s.getsockname()[1]; _s.close()
+check("M7 nothing listening -> False (no raise)",
+      _mqtt.publish("127.0.0.1", _dead, "t", "x", "N1") is False)
+check("M8 unresolvable host -> False (no raise)",
+      _mqtt.publish("no-such-host.invalid", 8883, "t", "x", "N1", timeout=2) is False)
+check("M12 nonsense port -> False (no raise)",
+      _mqtt.publish("127.0.0.1", "not-a-port", "t", "x", "N1") is False)
+
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", u"\u0e19\u0e49\u0e33\u0e17\u0e48\u0e27\u0e21", "N1"); _b.join()
+check("M9 non-ASCII payload goes out as UTF-8",
+      u"\u0e19\u0e49\u0e33\u0e17\u0e48\u0e27\u0e21".encode("utf-8") in _b.publish_pkt)
+
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", "x", "X" * 40); _b.join()
+check("M10 over-long client id truncated to 23", b"X" * 23 in _b.connect_pkt
+      and b"X" * 24 not in _b.connect_pkt)
+
+# ---- config: the port itself ----------------------------------------------
+check("M13 default port is 8883 (NOT 1883)",
+      Config(env_path=os.devnull, overrides={}).mqtt_port == 8883)
+_envf = os.path.join(tempfile.mkdtemp(), ".env"); _TMP.append(os.path.dirname(_envf))
+open(_envf, "w").write("MQTT_HOST=h\nMQTT_PORT=1234\n")
+check("M14 .env MQTT_PORT wins", Config(env_path=_envf, overrides={}).mqtt_port == 1234)
+open(_envf, "w").write("MQTT_PORT=eight-thousand\n")
+check("M15 malformed MQTT_PORT falls back, does not raise",
+      Config(env_path=_envf, overrides={}).mqtt_port == 8883)
+
+# ---- integration: emit / heartbeat / escalate ------------------------------
+def mqctx(ok=True):
+    """Capture what emit() hands the transport, without opening a socket."""
+    cfg = Config(env_path=os.devnull, overrides={})
+    cfg.state_dir = tempfile.mkdtemp(); _TMP.append(cfg.state_dir)
+    cfg.device_id = "PAT-TEST-M"; cfg.dry_run = False
+    calls = []
+    def fake(host, port, topic, payload, client_id, **kw):
+        calls.append({"host": host, "port": port, "topic": topic,
+                      "payload": payload, "cid": client_id})
+        return ok
+    return cfg, calls, fake
+
+_orig_pub = _mqtt.publish
+try:
+    cfg, calls, fake = mqctx(ok=True)
+    _events.mqtt.publish = fake
+    _events.emit(cfg, "radar.sensor-absent")                 # sev=error -> pushes
+    check("M16 emit pushes on error severity", len(calls) == 1)
+    check("M16 emit uses cfg.mqtt_port, not 1883",
+          calls and calls[0]["port"] == 8883)
+    check("M16 emit topic is fleet/events/<node>",
+          calls and calls[0]["topic"] == "fleet/events/%s" % cfg.node_id)
+    _events.emit(cfg, "agent.alive")                          # sev=info -> no push
+    check("M23 info severity does NOT push", len(calls) == 1)
+    check("M18 success -> push=1, no pfail",
+          _events.push_health(cfg) == {"push": 1})
+
+    cfg, calls, fake = mqctx(ok=False)
+    _events.mqtt.publish = fake
+    check("M21 no push ever attempted -> {} (absent, NOT zero)",
+          _events.push_health(cfg) == {})
+    _events.emit(cfg, "radar.sensor-absent")
+    check("M17 failure recorded as push=0 pfail=1",
+          _events.push_health(cfg) == {"push": 0, "pfail": 1})
+    _events.emit(cfg, "radar.sensor-absent")
+    _events.emit(cfg, "radar.sensor-absent")
+    check("M19 consecutive failures accumulate",
+          _events.push_health(cfg).get("pfail") == 3)
+    _events.mqtt.publish = lambda *a, **k: True
+    _events.emit(cfg, "radar.sensor-absent")
+    check("M20 a success resets the failure run",
+          _events.push_health(cfg) == {"push": 1})
+
+    # the tick must survive a transport that explodes
+    cfg, calls, fake = mqctx()
+    def boom(*a, **k): raise RuntimeError("socket exploded")
+    _events.mqtt.publish = boom
+    _raised = False
+    try:
+        _events.emit(cfg, "radar.sensor-absent")
+    except Exception:
+        _raised = True
+    check("M24 a throwing transport must not kill the tick", _raised is False)
+
+    # heartbeat carries the previous outcome
+    cfg, calls, fake = mqctx(ok=False)
+    _events.mqtt.publish = fake
+    cfg.heartbeat_s = 0
+    _events.emit(cfg, "radar.sensor-absent")                 # one failed push on record
+    _events.heartbeat(cfg, sw="525")
+    _hb = [_json.loads(l) for l in open(os.path.join(cfg.state_dir, "events.jsonl"))
+           if '"agent.alive"' in l]
+    check("M22 heartbeat carries push health",
+          bool(_hb) and _hb[-1]["d"].get("push") == 0 and _hb[-1]["d"].get("pfail") >= 1)
+    check("M22 heartbeat keeps its own fields too",
+          bool(_hb) and _hb[-1]["d"].get("sw") == "525")
+
+    # escalate
+    cfg, calls, fake = mqctx(ok=False)
+    _escalate.mqtt.publish = fake
+    _escalate.escalate(cfg, "connectivity", "wan-down", {"k": 1})
+    check("M25 escalate uses cfg.mqtt_port", calls and calls[0]["port"] == 8883)
+    check("M25 escalate topic is healer/<id>/escalate",
+          calls and calls[0]["topic"] == "healer/%s/escalate" % cfg.device_id)
+    _log = open(os.path.join(cfg.state_dir, "healer.log")).read()
+    check("M25 escalate records the failure instead of swallowing it",
+          "escalate-publish-failed" in _log)
+finally:
+    _events.mqtt.publish = _orig_pub
+    _escalate.mqtt.publish = _orig_pub
+
 # ---------------------------------------------------------------------------
 for d in _TMP:
     shutil.rmtree(d, ignore_errors=True)

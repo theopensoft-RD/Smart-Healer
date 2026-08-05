@@ -17,6 +17,11 @@ class Config:
         # radar.py reads env HOST (default .106) -> match it so we probe the RIGHT sensor IP
         self.modbus_host = self.env.get("HOST") or self.env.get("MODBUS_HOST") or "192.168.1.106"
         self.mqtt_host   = self.env.get("MQTT_HOST", "localhost")
+        # Default 8883, NOT the conventional 1883: the fleet broker listens on 8883
+        # in CLEARTEXT and 1883 is closed (measured on pit003, 2026-08-05). The 6
+        # PISN nodes have no MQTT_PORT line in .env at all, so this default is
+        # exactly what they will use. A bad value must not crash the tick.
+        self.mqtt_port   = self._int(self.env.get("MQTT_PORT") or o.get("MQTT_PORT"), 8883)
         # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
         self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 
@@ -56,6 +61,14 @@ class Config:
         # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
         self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)
         self.ec25_settle_s    = int(o.get("EC25_SETTLE_S", "45"))     # wait after modem reset before judging recovery (< ~60s tick)
+
+    @staticmethod
+    def _int(v, default):
+        """Never let a malformed .env line crash the tick - fall back to default."""
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return default
 
     @staticmethod
     def _load_env(path):

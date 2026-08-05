@@ -13,8 +13,8 @@ SCHEMA_VERSION = 1
 
 CODES = {
     # --- agent / engine ---
-    "agent.alive":   {"sev": "info",  "desc": "heartbeat (proof-of-life)",
-                      "cause": "normal", "fix": "none"},
+    "agent.alive":   {"sev": "info",  "desc": "heartbeat (proof-of-life). d.push, when present, is the outcome of the PREVIOUS central MQTT push: 1 = a broker accepted it, 0 = it reached none; d.pfail counts consecutive failures. ABSENT means no push has ever been attempted - that is 'not measured', NOT zero",
+                      "cause": "normal", "fix": "d.push=0 with a rising d.pfail = the node is healing but the centre never hears about it: check MQTT_HOST/MQTT_PORT in .env (the fleet broker is 8883 CLEARTEXT; 1883 is closed) and that the node has a WAN path"},
     "agent.log":     {"sev": "debug", "desc": "free-text action log (transitional; carries d.msg)",
                       "cause": "informational", "fix": "none"},
     "agent.exc":     {"sev": "error", "desc": "a healer raised an exception (isolated; tick continued)",

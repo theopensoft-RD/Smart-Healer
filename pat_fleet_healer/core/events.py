@@ -15,10 +15,46 @@ import json
 import gzip
 import shutil
 from ..events_schema import CODES
+from . import mqtt
 
 EVENTS_FILE = "events.jsonl"
 HUMAN_FILE = "healer.log"
+PUSH_FILE = "push.state"                # last central-push outcome (see _record_push)
 ROTATE_BYTES = 4 * 1024 * 1024          # gzip-rotate the local JSONL past 4 MB
+
+
+def _record_push(cfg, ok):
+    """Remember whether the last central push reached a broker, and how many have
+    failed in a row. Local only - it must never itself push, or a broken uplink
+    would recurse. Surfaced on the heartbeat by push_health()."""
+    try:
+        st = json.load(open(os.path.join(cfg.state_dir, PUSH_FILE)))
+    except Exception:
+        st = {}
+    fail = 0 if ok else int(st.get("fail", 0) or 0) + 1
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+        json.dump({"ok": bool(ok), "fail": fail, "t": int(time.time())},
+                  open(os.path.join(cfg.state_dir, PUSH_FILE), "w"))
+    except Exception:
+        pass
+
+
+def push_health(cfg):
+    """Fields describing central reachability, for the heartbeat.
+
+    Returns {} when no push has EVER been attempted - absent, not zero. A node
+    that has had nothing worth pushing has not "failed to reach the centre", and
+    conflating the two is the same null-vs-zero error that invalidated the first
+    network report."""
+    try:
+        st = json.load(open(os.path.join(cfg.state_dir, PUSH_FILE)))
+    except Exception:
+        return {}
+    out = {"push": 1 if st.get("ok") else 0}
+    if st.get("fail"):
+        out["pfail"] = int(st["fail"])
+    return out
 
 
 def _atom(cfg, code, fields):
@@ -68,16 +104,22 @@ def emit(cfg, code, fields=None, push=None):
     except Exception:
         pass
 
-    # 3. central (MQTT) - notable events only, to keep the central stream small
+    # 3. central (MQTT) - notable events only, to keep the central stream small.
+    #    The result is RECORDED (see _record_push): a push that silently fails is
+    #    indistinguishable from "nothing to report", and that is precisely how the
+    #    centre went months without receiving a single healer event.
     if push is None:
         push = sev in ("warn", "error", "escalate")
     if push:
+        # mqtt.publish is written not to raise, but this guard is not redundant:
+        # emit() is called from the runner OUTSIDE the per-healer try, so ANY
+        # escape here kills the entire tick - every healer, not just the push.
         try:
-            import paho.mqtt.publish as publish
-            publish.single("fleet/events/%s" % cfg.node_id, payload=line,
-                           hostname=cfg.mqtt_host, port=1883, keepalive=10)
+            ok = mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
+                              "fleet/events/%s" % cfg.node_id, line, cfg.node_id)
         except Exception:
-            pass
+            ok = False
+        _record_push(cfg, ok)
 
 
 def heartbeat(cfg, **fields):
@@ -96,4 +138,8 @@ def heartbeat(cfg, **fields):
         open(f, "w").write(str(now))
     except Exception:
         pass
+    # carry the PREVIOUS push outcome: this is the one line that makes a dead
+    # uplink to the centre visible in the local log instead of silent.
+    fields = dict(fields or {})
+    fields.update(push_health(cfg))
     emit(cfg, "agent.alive", fields or None, push=True)
