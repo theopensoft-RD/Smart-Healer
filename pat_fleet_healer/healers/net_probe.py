@@ -52,9 +52,9 @@ class NetProbeHealer(Healer):
         gw_ok = self._ping(ctx, gw, 2)[0] if gw else None
 
         if not wan:
-            st = self._on_down(ctx, st, now, gw_ok)
+            st = self._on_down(ctx, st, now, gw_ok, dev)
         elif st.get("down_since"):
-            st = self._on_recover(ctx, st, now, gw_ok)
+            st = self._on_recover(ctx, st, now, gw_ok, dev)
 
         # The centre being unreachable while the internet is fine is its OWN failure
         # class - it is the evidence for "everything relays through one point", which
@@ -99,33 +99,74 @@ class NetProbeHealer(Healer):
         return st
 
     # --- state machine ----------------------------------------------------
-    def _on_down(self, ctx, st, now, gw_ok):
+    def _on_down(self, ctx, st, now, gw_ok, dev=None):
         if not st.get("down_since"):
-            st.update({"down_since": now, "gw_up": 0, "gw_down": 0, "gw_unk": 0})
-            self._write(ctx, {"k": "down", "gw": self._tri(gw_ok)})
+            st.update({"down_since": now, "gw_up": 0, "gw_down": 0, "gw_unk": 0,
+                       "dev": dev, "gwk": self._gw_kind(dev)})
+            self._write(ctx, {"k": "down", "gw": self._tri(gw_ok),
+                              "dev": dev, "gwk": self._gw_kind(dev)})
         # tally what the gateway was doing WHILE the WAN was gone - this tally
         # is the whole point of the probe
         key = "gw_up" if gw_ok is True else ("gw_down" if gw_ok is False else "gw_unk")
         st[key] = int(st.get(key, 0)) + 1
         return st
 
-    def _on_recover(self, ctx, st, now, gw_ok):
+    def _on_recover(self, ctx, st, now, gw_ok, dev=None):
         dur = now - int(st["down_since"])
         up, down, unk = int(st.get("gw_up", 0)), int(st.get("gw_down", 0)), int(st.get("gw_unk", 0))
-        verdict = self._verdict(up, down, unk)
+        # the kind is taken from when the outage OPENED. If the node failed over to
+        # a different interface mid-outage the two disagree and we can no longer say
+        # what was pinged, so the verdict must not claim a side.
+        gwk = st.get("gwk")
+        if self._gw_kind(dev) != gwk:
+            gwk = None
+        verdict = self._verdict(up, down, unk, gwk)
         self._write(ctx, {"k": "up", "dur": dur, "gw_up": up, "gw_down": down,
-                          "gw_unk": unk, "v": verdict})
-        ctx.event("probe.wan-outage", dur=dur, verdict=verdict, gw_up=up, gw_down=down)
-        for k in ("down_since", "gw_up", "gw_down", "gw_unk"):
+                          "gw_unk": unk, "v": verdict,
+                          "dev": st.get("dev"), "gwk": gwk})
+        ctx.event("probe.wan-outage", dur=dur, verdict=verdict, gw_up=up,
+                  gw_down=down, gwk=gwk)
+        for k in ("down_since", "gw_up", "gw_down", "gw_unk", "dev", "gwk"):
             st.pop(k, None)
         return st
 
+    # Interfaces on which the default gateway is this node's OWN cellular module
+    # rather than a separate box (usb0 = Quectel EC25 RNDIS on the IRIV/PISN nodes).
+    MODEM_IFACES = ("usb", "wwan", "wwp", "ppp")
+
+    @classmethod
+    def _gw_kind(cls, dev):
+        """Is the default gateway a SEPARATE device, or this node's own modem?
+
+        This decides what a "the gateway answered" verdict is actually worth:
+          pit/pir  -> default route is eth0, gateway 192.168.1.1 = the Robustel
+                      router, a separately powered box in the cabinet. Its
+                      answering rules out a local power/cable/node fault.
+          pisn     -> default route is usb0, gateway 192.168.225.1 = the EC25
+                      modem's OWN RNDIS interface. It answers for as long as the
+                      module is enumerated on USB - with no cellular registration
+                      at all. Calling that "carrier" would read as evidence about
+                      the network when it is nothing of the kind.
+        Returns None when the interface could not be read - which must NOT be
+        treated as "router".
+        """
+        if not dev:
+            return None
+        return "modem" if str(dev).lower().startswith(cls.MODEM_IFACES) else "router"
+
     @staticmethod
-    def _verdict(up, down, unk):
+    def _verdict(up, down, unk, gwk=None):
         """Who was missing during the outage. 'unknown' when we could not tell -
-        never guessed, never defaulted to a side."""
+        never guessed, never defaulted to a side.
+
+        gwk gates the "carrier" answer ONLY, and it must be a positively identified
+        separate router: on a modem gateway (or when we could not tell which it
+        was) an answering gateway proves the module is alive, not that the fault
+        was upstream. "onsite" needs no gate - a gateway that STOPPED answering is
+        a local fault whichever kind it is.
+        """
         if up and not down:
-            return "carrier"        # gateway fine, internet gone -> upstream
+            return "carrier" if gwk == "router" else "unknown"
         if down and not up:
             return "onsite"         # gateway gone too -> equipment/cabinet
         if up and down:

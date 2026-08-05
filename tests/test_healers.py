@@ -716,16 +716,20 @@ check("P3 down row records the gateway was reachable", d and d[0]["gw"] == 1)
 check("P3 down -> outage clock started", rec["saved"] and rec["saved"].get("down_since"))
 
 # ---- the discriminator: who was missing during the outage? ----------------
-def outage(gw, ticks=3, elapsed=180):
-    """Run `ticks` down-ticks with a given gateway state, then recover."""
-    sh = sh_net(ping=gw)
+ETH_ROUTE = "default via 192.168.1.1 dev eth0 proto dhcp"
+USB_ROUTE = "default via 192.168.225.1 dev usb0 proto dhcp"   # the real PISN route
+
+def outage(gw, ticks=3, elapsed=180, route=ETH_ROUTE, route2=None):
+    """Run `ticks` down-ticks with a given gateway state, then recover.
+    route2 lets a test change the WAN interface mid-outage (failover)."""
+    sh = sh_net(ping=gw, route=route)
     ctx, rec = mkprobe(sh=sh, **DOWN_WAN)
     p = NetProbeHealer()
     for _ in range(ticks):
         p.run(ctx)
     st = dict(rec["saved"] or {})
     st["down_since"] = int(time.time()) - elapsed          # age the outage
-    ctx2, rec2 = mkprobe(sh=sh, state=st)                  # WAN back up
+    ctx2, rec2 = mkprobe(sh=sh_net(ping=gw, route=route2 or route), state=st)
     ctx2.cfg.state_dir = ctx.cfg.state_dir                 # same probe file
     p.run(ctx2)
     return ctx2, rec2
@@ -1024,6 +1028,69 @@ check("E6 bundle manifest decodes codes", "radar.sensor-moved" in _b["manifest"]
 check("E6 bundle redacts secrets", "hunter2" not in gzip.open(_out).read().decode())
 check("E6 bundle compresses", _comp <= _raw)
 
+
+
+# ---------------------------------------------------------------------------
+# G1-G12  what the gateway ACTUALLY is decides what "carrier" is worth.
+# Found 2026-08-05 from the first real probe data: all 7 recorded outages were
+# verdict "carrier", and all 7 came from pisn002 - the one node class where that
+# verdict means the least. On pit/pir the default route is eth0 and the gateway
+# 192.168.1.1 is the Robustel, a separately powered box in the cabinet. On the
+# PISN IRIVs the route is usb0 and the gateway 192.168.225.1 is the EC25 modem's
+# OWN RNDIS interface: it answers while the module is merely enumerated on USB,
+# with no cellular registration at all. Same word, different evidence.
+# ---------------------------------------------------------------------------
+check("G1 eth0 gateway is a separate router", NetProbeHealer._gw_kind("eth0") == "router")
+check("G1 eno1 gateway is a separate router", NetProbeHealer._gw_kind("eno1") == "router")
+check("G1 usb0 gateway is the node's own modem", NetProbeHealer._gw_kind("usb0") == "modem")
+check("G1 wwan0 is a modem", NetProbeHealer._gw_kind("wwan0") == "modem")
+check("G1 ppp0 is a modem", NetProbeHealer._gw_kind("ppp0") == "modem")
+check("G1 unknown interface -> None, never 'router'", NetProbeHealer._gw_kind(None) is None)
+check("G1 empty interface -> None", NetProbeHealer._gw_kind("") is None)
+
+check("G2 modem gateway up throughout is NOT evidence of 'carrier'",
+      NetProbeHealer._verdict(5, 0, 0, "modem") == "unknown")
+check("G3 router gateway up throughout IS 'carrier'",
+      NetProbeHealer._verdict(5, 0, 0, "router") == "carrier")
+check("G4 unidentified gateway must not claim 'carrier'",
+      NetProbeHealer._verdict(5, 0, 0, None) == "unknown")
+check("G5 'onsite' needs no gate - a dead gateway is local either way",
+      NetProbeHealer._verdict(0, 5, 0, "modem") == "onsite"
+      and NetProbeHealer._verdict(0, 5, 0, "router") == "onsite")
+
+# end to end through the state machine, on the REAL pisn route string
+ctx, rec = outage("up", route=USB_ROUTE)
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("G6 PISN outage: gateway up throughout -> 'unknown', NOT 'carrier'",
+      u and u[0]["v"] == "unknown")
+check("G6 PISN outage still records the raw tallies (nothing lost)",
+      u and u[0]["gw_up"] >= 1 and u[0]["gw_down"] == 0)
+check("G7 up row carries the interface", u and u[0].get("dev") == "usb0")
+check("G7 up row carries the gateway kind", u and u[0].get("gwk") == "modem")
+d = [r for r in probe_rows(ctx) if r["k"] == "down"]
+check("G8 down row carries interface + kind",
+      d and d[0].get("dev") == "usb0" and d[0].get("gwk") == "modem")
+check("G9 the event carries the gateway kind too",
+      any(c == "probe.wan-outage" and f.get("gwk") == "modem" for c, f in rec["events"]))
+
+# the 56 pit/pir nodes must be UNAFFECTED
+ctx, rec = outage("up", route=ETH_ROUTE)
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("G10 pit/pir keep their discriminator: verdict stays 'carrier'",
+      u and u[0]["v"] == "carrier")
+check("G10 pit/pir rows labelled router/eth0",
+      u and u[0].get("gwk") == "router" and u[0].get("dev") == "eth0")
+
+# a cabinet fault on a PISN node must still read as onsite
+ctx, rec = outage("down", route=USB_ROUTE)
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("G11 PISN cabinet fault still reads 'onsite'", u and u[0]["v"] == "onsite")
+
+# interface changed mid-outage -> we no longer know what was pinged
+ctx, rec = outage("up", route=ETH_ROUTE, route2=USB_ROUTE)
+u = [r for r in probe_rows(ctx) if r["k"] == "up"]
+check("G12 interface changed mid-outage -> no side claimed",
+      u and u[0]["v"] == "unknown" and u[0].get("gwk") is None)
 
 # ---------------------------------------------------------------------------
 # M1-M25  central push (MQTT).  The bug being closed: events.py hardcoded port

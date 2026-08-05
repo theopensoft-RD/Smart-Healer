@@ -76,9 +76,9 @@ CODES = {
                       "cause": "unit/binary", "fix": "manual restart beszel-agent"},
 
     # --- phase-1 network probe (measures, never remediates) ---
-    "probe.wan-outage": {"sev": "info", "desc": "a WAN outage ended: d.dur seconds, and d.verdict says who was missing (carrier = the LAN gateway answered throughout, so the fault was upstream; onsite = the gateway went too, so the fault was in the cabinet; mixed/unknown = cannot attribute)",
+    "probe.wan-outage": {"sev": "info", "desc": "a WAN outage ended: d.dur seconds, and d.verdict says who was missing. onsite = the gateway stopped answering too, so the fault was below the uplink (cabinet/power/cable) - valid on every node. carrier = the gateway answered throughout AND that gateway is a SEPARATE router (d.gwk='router', i.e. the Robustel on eth0), so the fault was above it. mixed/unknown = cannot attribute. d.gwk names what was pinged: 'router' = a separate box, 'modem' = this node's OWN cellular module (the EC25 on usb0, PISN nodes), null = could not tell",
                       "cause": "normal telemetry, not a fault report",
-                      "fix": "none - this is the record that lets a human separate 'the carrier failed' from 'our box failed'; detail rows are in netprobe.jsonl"},
+                      "fix": "none - but WEIGHT it by d.gwk: on a 'modem' node an answering gateway only proves the module is enumerated on USB, not that the cellular network was at fault, so those outages are reported 'unknown' and must NOT be pooled with 'carrier' ones. Detail rows are in netprobe.jsonl"},
 
     "probe.centre-unreachable": {"sev": "info", "desc": "the internet was fine but the CENTRE was not reachable for d.dur seconds - a failure class distinct from a WAN outage",
                       "cause": "relay/overlay, central ingest, or upstream of the datacentre",
