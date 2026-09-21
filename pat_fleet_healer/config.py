@@ -17,11 +17,14 @@ class Config:
         # radar.py reads env HOST (default .106) -> match it so we probe the RIGHT sensor IP
         self.modbus_host = self.env.get("HOST") or self.env.get("MODBUS_HOST") or "192.168.1.106"
         self.mqtt_host   = self.env.get("MQTT_HOST", "localhost")
-        # Default 8883, NOT the conventional 1883: the fleet broker listens on 8883
-        # in CLEARTEXT and 1883 is closed (measured on pit003, 2026-08-05). The 6
-        # PISN nodes have no MQTT_PORT line in .env at all, so this default is
-        # exactly what they will use. A bad value must not crash the tick.
-        self.mqtt_port   = self._int(self.env.get("MQTT_PORT") or o.get("MQTT_PORT"), 8883)
+        # Default 1883: since 2026-09-21 every node publishes to the OVERLAY broker
+        # (10.0.4.80 over NetBird wt0), whose plain listener is 1883. Up to v528 the
+        # default was 8883 because the PUBLIC NAT (mqtt.pattaya-smart-sanitary.com)
+        # forwarded 8883 to that same plain listener and left 1883 closed; that
+        # public path is being retired. A node whose .env has no MQTT_PORT line
+        # (the 6 PISN signs until 2026-09-21) MUST land on the overlay port, not the
+        # retired one. A bad value must not crash the tick.
+        self.mqtt_port   = self._int(self.env.get("MQTT_PORT") or o.get("MQTT_PORT"), 1883)
         # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
         self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 
@@ -54,9 +57,14 @@ class Config:
         # Transitions are recorded every tick; this is only the telemetry cadence.
         self.probe_sample_s = int(o.get("PROBE_SAMPLE_S", "300"))
         # TCP endpoint that stands for "the centre". ICMP is filtered inbound, so a
-        # handshake is the only honest reachability test. 8883 not 1883: plain MQTT
-        # is closed fleet-wide (verified 2026-08-04) - see the note in core/events.
-        self.probe_centre = o.get("PROBE_CENTRE", "mqtt.pattaya-smart-sanitary.com:8883")
+        # handshake is the only honest reachability test. Defaults to the broker the
+        # node actually publishes to (MQTT_HOST:MQTT_PORT) so it can never drift from
+        # the publish target again: up to v528 this hardcoded the retired public NAT
+        # and read ONLY os.environ, so no .env edit could correct it and every node
+        # would have pinned a false "centre unreachable" once that NAT closed. Now
+        # overridable from .env or the environment; "host:port" or the probe is off.
+        self.probe_centre = (self.env.get("PROBE_CENTRE") or o.get("PROBE_CENTRE")
+                             or "%s:%d" % (self.mqtt_host, self.mqtt_port))
 
         # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
         self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)

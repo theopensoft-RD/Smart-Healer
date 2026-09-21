@@ -1314,14 +1314,35 @@ check("M10 over-long client id truncated to 23", b"X" * 23 in _b.connect_pkt
       and b"X" * 24 not in _b.connect_pkt)
 
 # ---- config: the port itself ----------------------------------------------
-check("M13 default port is 8883 (NOT 1883)",
-      Config(env_path=os.devnull, overrides={}).mqtt_port == 8883)
+# v529: the default moved 8883 -> 1883 when the fleet left the public NAT for the
+# overlay broker (10.0.4.80), whose plain listener is 1883 and whose 8883 is REAL
+# TLS. A node with no MQTT_PORT line (the PISN signs) must land on 1883.
+check("M13 default port is 1883 (overlay plain listener; NOT the retired 8883)",
+      Config(env_path=os.devnull, overrides={}).mqtt_port == 1883)
 _envf = os.path.join(tempfile.mkdtemp(), ".env"); _TMP.append(os.path.dirname(_envf))
 open(_envf, "w").write("MQTT_HOST=h\nMQTT_PORT=1234\n")
 check("M14 .env MQTT_PORT wins", Config(env_path=_envf, overrides={}).mqtt_port == 1234)
 open(_envf, "w").write("MQTT_PORT=eight-thousand\n")
 check("M15 malformed MQTT_PORT falls back, does not raise",
-      Config(env_path=_envf, overrides={}).mqtt_port == 8883)
+      Config(env_path=_envf, overrides={}).mqtt_port == 1883)
+
+# ---- config: the centre probe target --------------------------------------
+# v529: PROBE_CENTRE derives from the publish target instead of hardcoding the
+# retired public NAT, and is overridable from .env (before: os.environ only, so
+# no .env edit could ever correct it).
+open(_envf, "w").write("MQTT_HOST=10.9.9.9\nMQTT_PORT=1883\n")
+check("M26 probe_centre defaults to MQTT_HOST:MQTT_PORT (never drifts from the publish target)",
+      Config(env_path=_envf, overrides={}).probe_centre == "10.9.9.9:1883")
+check("M27 probe_centre with no .env at all is still host:port, never the public NAT",
+      Config(env_path=os.devnull, overrides={}).probe_centre == "localhost:1883")
+open(_envf, "w").write("MQTT_HOST=10.9.9.9\nMQTT_PORT=1883\nPROBE_CENTRE=probe.example:9999\n")
+check("M28 .env PROBE_CENTRE overrides the derived default",
+      Config(env_path=_envf, overrides={}).probe_centre == "probe.example:9999")
+check("M29 environment PROBE_CENTRE still works (systemd drop-in path)",
+      Config(env_path=os.devnull, overrides={"PROBE_CENTRE": "env.example:7"}).probe_centre
+      == "env.example:7")
+check("M30 no default anywhere names the retired public endpoint",
+      "pattaya-smart-sanitary" not in Config(env_path=os.devnull, overrides={}).probe_centre)
 
 # ---- integration: emit / heartbeat / escalate ------------------------------
 def mqctx(ok=True):
@@ -1329,6 +1350,10 @@ def mqctx(ok=True):
     cfg = Config(env_path=os.devnull, overrides={})
     cfg.state_dir = tempfile.mkdtemp(); _TMP.append(cfg.state_dir)
     cfg.device_id = "PAT-TEST-M"; cfg.dry_run = False
+    # a port that is NEITHER default (old 8883, new 1883): proves the transport takes
+    # cfg.mqtt_port rather than any hardcoded number - the old `== 8883` assertion
+    # against a default-built Config could not tell those apart.
+    cfg.mqtt_port = 18830
     calls = []
     def fake(host, port, topic, payload, client_id, **kw):
         calls.append({"host": host, "port": port, "topic": topic,
@@ -1342,8 +1367,8 @@ try:
     _events.mqtt.publish = fake
     _events.emit(cfg, "radar.sensor-absent")                 # sev=error -> pushes
     check("M16 emit pushes on error severity", len(calls) == 1)
-    check("M16 emit uses cfg.mqtt_port, not 1883",
-          calls and calls[0]["port"] == 8883)
+    check("M16 emit uses cfg.mqtt_port, not a hardcoded 1883/8883",
+          calls and calls[0]["port"] == 18830)
     check("M16 emit topic is fleet/events/<node>",
           calls and calls[0]["topic"] == "fleet/events/%s" % cfg.node_id)
     _events.emit(cfg, "agent.alive")                          # sev=info -> no push
@@ -1395,7 +1420,8 @@ try:
     cfg, calls, fake = mqctx(ok=False)
     _escalate.mqtt.publish = fake
     _escalate.escalate(cfg, "connectivity", "wan-down", {"k": 1})
-    check("M25 escalate uses cfg.mqtt_port", calls and calls[0]["port"] == 8883)
+    check("M25 escalate uses cfg.mqtt_port, not a hardcoded 1883/8883",
+          calls and calls[0]["port"] == 18830)
     check("M25 escalate topic is healer/<id>/escalate",
           calls and calls[0]["topic"] == "healer/%s/escalate" % cfg.device_id)
     _log = open(os.path.join(cfg.state_dir, "healer.log")).read()

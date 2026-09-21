@@ -1,6 +1,11 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 525 - probe also records relay/overlay health, whether the
+Modular package (rev 529 - MQTT_PORT default 8883 -> 1883 and PROBE_CENTRE now
+derives from MQTT_HOST:MQTT_PORT (overridable from .env), because the fleet left
+the public NAT for the overlay broker 10.0.4.80 on 2026-09-21 and the old defaults
+would have sent any node lacking an MQTT_PORT line - the 6 PISN signs - back to
+the retired public endpoint, and pinned a false centre-unreachable everywhere;
+rev 525 - probe also records relay/overlay health, whether the
 CENTRE was reachable while the internet was fine, node uptime (reboot vs outage),
 jitter/loss, clock sync, disk and memory;
 rev 524 - phase-1 network probe: outage duration + a
@@ -33,4 +38,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "528"
+__version__ = "529"

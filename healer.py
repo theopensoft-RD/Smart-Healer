@@ -128,12 +128,14 @@ def escalate(healer, verdict, ev=None):
     # publish to central (best-effort; the log line above is the record of truth).
     # LEGACY FILE: the deployed artifact is healer.pyz, built from pat_fleet_healer/.
     # This monolith is kept only because install-healer.sh still points a node's
-    # ExecStart at it - so its port must not be allowed to disagree. 8883 not 1883:
-    # 1883 is closed fleet-wide and 8883 serves plain MQTT (measured 2026-08-05).
+    # ExecStart at it - so its port must not be allowed to disagree with
+    # pat_fleet_healer/config.py. 1883 = the overlay broker's plain listener
+    # (10.0.4.80, since 2026-09-21); 8883 there is real TLS and resets plaintext.
+    # (Up to v528 this said 8883, for the retired public NAT.)
     try:
         import paho.mqtt.publish as publish
         publish.single("healer/%s/escalate" % DEVICE_ID, payload=payload,
-                       hostname=MQTT_HOST, port=int(os.getenv("MQTT_PORT") or 8883),
+                       hostname=MQTT_HOST, port=int(os.getenv("MQTT_PORT") or 1883),
                        keepalive=10)
     except Exception as e:
         log("escalate-publish-skip (%r) - logged only" % e)

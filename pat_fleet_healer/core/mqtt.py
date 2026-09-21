@@ -14,12 +14,18 @@ A QoS-0 publish is CONNECT / CONNACK / PUBLISH / DISCONNECT and nothing more, so
 carrying ~50 lines removes a dependency the fleet cannot satisfy uniformly, and
 leaves ONE code path to reason about instead of two.
 
-MEASURED BROKER FACTS (pit003 -> mqtt.pattaya-smart-sanitary.com, 2026-08-05):
-  port 1883  -> timeout (closed).  This is what the old code was hardcoded to.
-  port 8883  -> PLAIN MQTT, accepted, no credentials required.
-  port 8883 + TLS -> connection reset (the broker does NOT speak TLS).
-So 8883 here is the *cleartext* port despite 8883 being the IANA "secure-mqtt"
-number. No TLS is attempted; adding one would break every publish.
+BROKER FACTS - current (overlay, since 2026-09-21):
+  Every node publishes to the OVERLAY VIP 10.0.4.80 (NetBird wt0):
+  port 1883  -> PLAIN MQTT, accepted, no credentials required (this is the default).
+  port 8883  -> the broker's REAL TLS listener; it RESETS a plaintext CONNECT.
+  So on the overlay a node left on 8883 fails EVERY publish - the opposite of the
+  old public path. No TLS is attempted by this module.
+
+BROKER FACTS - historical (public NAT, measured pit003 -> mqtt.pattaya-smart-sanitary.com, 2026-08-05):
+  port 1883  -> timeout (closed).
+  port 8883  -> PLAIN MQTT (the NAT forwarded 8883 to the plain listener).
+  That is why v520-v528 defaulted to 8883. The public NAT is being retired; do not
+  reintroduce that default.
 
 This module MUST NOT raise: its caller is an event emitter, not a transport.
 """
