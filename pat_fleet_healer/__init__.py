@@ -1,6 +1,10 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 529 - MQTT_PORT default 8883 -> 1883 and PROBE_CENTRE now
+Modular package (rev 530 - the publisher can authenticate: optional MQTT_USERNAME/
+MQTT_PASSWORD in the CONNECT packet, so the healer survives the broker dropping
+allow_anonymous. It cannot use TLS (raw socket, no ssl), so user/pass is its ONLY
+auth path; with no credentials set the CONNECT is byte-identical to rev 529;
+rev 529 - MQTT_PORT default 8883 -> 1883 and PROBE_CENTRE now
 derives from MQTT_HOST:MQTT_PORT (overridable from .env), because the fleet left
 the public NAT for the overlay broker 10.0.4.80 on 2026-09-21 and the old defaults
 would have sent any node lacking an MQTT_PORT line - the 6 PISN signs - back to
@@ -38,4 +42,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "529"
+__version__ = "530"

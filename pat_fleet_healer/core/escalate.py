@@ -13,6 +13,8 @@ def escalate(cfg, healer, verdict, ev=None):
                           "evidence": ev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ")},
                          ensure_ascii=False)
     if not mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
-                        "healer/%s/escalate" % cfg.device_id, payload, cfg.node_id):
+                        "healer/%s/escalate" % cfg.device_id, payload, cfg.node_id,
+                        username=getattr(cfg, "mqtt_username", "") or None,
+                        password=getattr(cfg, "mqtt_password", "") or None):
         log(cfg, "escalate-publish-failed (%s:%s) - logged only"
                  % (cfg.mqtt_host, cfg.mqtt_port))

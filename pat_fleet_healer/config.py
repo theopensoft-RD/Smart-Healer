@@ -25,6 +25,12 @@ class Config:
         # (the 6 PISN signs until 2026-09-21) MUST land on the overlay port, not the
         # retired one. A bad value must not crash the tick.
         self.mqtt_port   = self._int(self.env.get("MQTT_PORT") or o.get("MQTT_PORT"), 1883)
+        # Optional broker credentials. Empty = anonymous, byte-identical to pre-v530.
+        # The healer's transport is a hand-rolled QoS-0 publisher on a raw socket and
+        # CANNOT do TLS, so username/password is its only way to authenticate once the
+        # broker drops allow_anonymous. Never logged, never put in an event payload.
+        self.mqtt_username = self.env.get("MQTT_USERNAME") or o.get("MQTT_USERNAME") or ""
+        self.mqtt_password = self.env.get("MQTT_PASSWORD") or o.get("MQTT_PASSWORD") or ""
         # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
         self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 

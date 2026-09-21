@@ -1344,6 +1344,50 @@ check("M29 environment PROBE_CENTRE still works (systemd drop-in path)",
 check("M30 no default anywhere names the retired public endpoint",
       "pattaya-smart-sanitary" not in Config(env_path=os.devnull, overrides={}).probe_centre)
 
+# ---- config + wire format: broker credentials (v530) -----------------------
+# The healer cannot speak TLS (raw socket, no ssl import), so username/password is its
+# ONLY way to authenticate once the broker drops allow_anonymous.
+check("M31 no credentials configured by default",
+      Config(env_path=os.devnull, overrides={}).mqtt_username == ""
+      and Config(env_path=os.devnull, overrides={}).mqtt_password == "")
+open(_envf, "w").write("MQTT_USERNAME=node-a\nMQTT_PASSWORD=pw123\n")
+_cc = Config(env_path=_envf, overrides={})
+check("M32 credentials load from .env", _cc.mqtt_username == "node-a" and _cc.mqtt_password == "pw123")
+check("M33 credentials also settable from the environment",
+      Config(env_path=os.devnull, overrides={"MQTT_USERNAME": "e"}).mqtt_username == "e")
+
+# wire format: inspect the CONNECT packet a real broker would receive.
+# Layout: [0]=0x10 [1]=remlen 0x00 0x04 'M''Q''T''T' [8]=level [9]=flags
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", "x", "CID"); _b.join()
+check("M34 anonymous CONNECT unchanged from pre-v530 (level 4, flags 0x02, no creds)",
+      _b.connect_pkt[8:10] == b"\x04\x02" and b"node-a" not in _b.connect_pkt)
+
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", "x", "CID", username="node-a", password="pw123"); _b.join()
+check("M35 user+password sets CONNECT flags 0x80|0x40|0x02 = 0xC2",
+      _b.connect_pkt[8:10] == b"\x04\xc2")
+check("M36 username then password both present, in spec order",
+      b"node-a" in _b.connect_pkt and b"pw123" in _b.connect_pkt
+      and _b.connect_pkt.index(b"node-a") < _b.connect_pkt.index(b"pw123"))
+
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", "x", "CID", username="node-a"); _b.join()
+check("M37 username alone sets 0x80|0x02 = 0x82",
+      _b.connect_pkt[8:10] == b"\x04\x82" and b"node-a" in _b.connect_pkt)
+
+_b = FakeBroker()
+_mqtt.publish("127.0.0.1", _b.port, "t", "x", "CID", password="orphan"); _b.join()
+check("M38 password WITHOUT username is ignored (MQTT 3.1.1 3.1.2.9)",
+      _b.connect_pkt[8:10] == b"\x04\x02" and b"orphan" not in _b.connect_pkt)
+
+check("M39 CONNACK rc=4 (bad user/password) -> False, no raise",
+      _mqtt.publish("127.0.0.1", FakeBroker(connack_rc=4).port, "t", "x", "CID",
+                    username="u", password="bad") is False)
+check("M40 CONNACK rc=5 (not authorized) -> False, no raise",
+      _mqtt.publish("127.0.0.1", FakeBroker(connack_rc=5).port, "t", "x", "CID",
+                    username="u", password="p") is False)
+
 # ---- integration: emit / heartbeat / escalate ------------------------------
 def mqctx(ok=True):
     """Capture what emit() hands the transport, without opening a socket."""

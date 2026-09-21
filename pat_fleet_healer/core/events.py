@@ -116,7 +116,9 @@ def emit(cfg, code, fields=None, push=None):
         # escape here kills the entire tick - every healer, not just the push.
         try:
             ok = mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
-                              "fleet/events/%s" % cfg.node_id, line, cfg.node_id)
+                              "fleet/events/%s" % cfg.node_id, line, cfg.node_id,
+                              username=getattr(cfg, "mqtt_username", "") or None,
+                              password=getattr(cfg, "mqtt_password", "") or None)
         except Exception:
             ok = False
         _record_push(cfg, ok)

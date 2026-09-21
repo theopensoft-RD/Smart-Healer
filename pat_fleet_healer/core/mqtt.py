@@ -65,14 +65,20 @@ def _recv_exactly(sock, n):
     return buf
 
 
-def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0):
+def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0,
+            username=None, password=None):
     """Publish ONE QoS-0 message.
 
     Returns True only if the broker sent CONNACK with return code 0 AND the
     PUBLISH was written to the socket. QoS 0 has no publish acknowledgement, so
     True means "handed to a broker that accepted us", never "stored". Anything
     else - DNS failure, refused connection, timeout, rejected client id, protocol
-    surprise - returns False. It never raises.
+    surprise, BAD CREDENTIALS - returns False. It never raises.
+
+    username/password are optional (MQTT 3.1.1 3.1.2.8/3.1.2.9). When username is
+    None/empty the CONNECT is byte-identical to the pre-v530 anonymous one, so this
+    is inert until credentials are actually configured. Per the spec a password
+    MUST NOT be sent without a username, so password alone is ignored.
     """
     sock = None
     try:
@@ -81,9 +87,20 @@ def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0):
         sock = socket.create_connection((host, int(port)), timeout)
         sock.settimeout(timeout)
 
-        # CONNECT: protocol "MQTT" level 4, flags 0x02 (clean session), no auth.
-        var = _mqtt_str("MQTT") + bytes(bytearray([0x04, 0x02])) + struct.pack(">H", keepalive)
+        # CONNECT: protocol "MQTT" level 4. Flags: 0x02 clean session, +0x80 username,
+        # +0x40 password. Credential fields go at the END of the payload, after the
+        # client id, in that order.
+        flags = 0x02
+        if username:
+            flags |= 0x80
+            if password:
+                flags |= 0x40
+        var = _mqtt_str("MQTT") + bytes(bytearray([0x04, flags])) + struct.pack(">H", keepalive)
         body = var + _mqtt_str(str(client_id)[:MAX_CLIENT_ID])
+        if username:
+            body += _mqtt_str(username)
+            if password:
+                body += _mqtt_str(password)
         sock.sendall(bytes(bytearray([CONNECT])) + _remaining_length(len(body)) + body)
 
         head = _recv_exactly(sock, 2)
@@ -91,7 +108,9 @@ def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0):
             return False
         rest = _recv_exactly(sock, head[1])
         if not rest or len(rest) < 2 or rest[1] != 0:
-            return False                     # broker refused us; do NOT call it sent
+            # rc 4 = bad username/password, rc 5 = not authorized. Both land here:
+            # the broker refused us; do NOT call it sent.
+            return False
 
         body = _mqtt_str(topic) + payload
         sock.sendall(bytes(bytearray([PUBLISH])) + _remaining_length(len(body)) + body)
