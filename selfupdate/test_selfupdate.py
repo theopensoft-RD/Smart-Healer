@@ -182,7 +182,10 @@ def suite(label, openssl_bin):
     check("[%s] U1 valid sig + newer -> installed" % label,
           open(os.path.join(w, "healer.pyz"), "rb").read() == NEW)
     check("[%s] U1 -> emits selfupdate.ok" % label, "healer.selfupdate.ok" in events_of(st))
-    check("[%s] U1 -> keeps a rollback copy" % label, os.path.exists(os.path.join(w, "healer.pyz.prev")))
+    check("[%s] U1 -> keeps a rollback copy (.good)" % label,
+          os.path.exists(os.path.join(w, "healer.pyz.good")))
+    check("[%s] U1 -> .good holds the PROVEN build, not the one just installed" % label,
+          open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"INSTALLED-ARTIFACT")
 
     # U2 tampered artifact -> rejected, current healer untouched  (the security promise)
     home, w, st = make_home(pub, fake_python=fake_py("521"))
@@ -271,34 +274,47 @@ def suite(label, openssl_bin):
 
 
 
-    # ---- U11/U12: AUTO-ROLLBACK (v532). Until then .prev was SAVED but never
-    # RESTORED, so a build that passed the pre-install selftest and then failed in
-    # real operation left the node broken forever with a good artifact beside it.
-    # U11 immediate gate: passes selftest from /tmp, fails once installed -> roll back
+
+    # ---- U11-U14: PROMOTION-BASED ROLLBACK (v533). The fallback is the last artifact
+    # that PROVED itself on this node, never merely "the previous one".
+    # U11 immediate gate: passes selftest from /tmp, fails once installed -> restore .good
     home, w, st = make_home(pub, fake_python=fake_py_installed_fail("521"))
     run_update(home, make_release(999, NEW, key), shim)
-    check("[%s] U11 broken-once-installed -> ROLLED BACK" % label,
+    # The artifact that was running had no pending marker, so the gate promoted it to
+    # .good before fetching. The failed update therefore lands back on exactly the
+    # build that had proved itself - which is the whole point of the design.
+    check("[%s] U11 broken-once-installed -> restored to the PROVEN build" % label,
           open(os.path.join(w, "healer.pyz"), "rb").read() == b"INSTALLED-ARTIFACT")
     check("[%s] U11 -> emits selfupdate.rollback" % label,
           "healer.selfupdate.rollback" in events_of(st))
 
-    # U12 deferred gate: a stale update.pending means the new build never completed a
-    # real tick (the runner deletes that marker after a healthy one) -> roll back
+    # U12 deferred gate: stale update.pending = the build never completed a real tick
     home, w, st = make_home(pub, fake_python=fake_py("777"))
-    open(os.path.join(w, "healer.pyz.prev"), "wb").write(b"PREV-GOOD")
+    open(os.path.join(w, "healer.pyz.good"), "wb").write(b"GOOD-ARTIFACT")
     pend = os.path.join(st, "update.pending")
-    open(pend, "w").close()
-    os.utime(pend, (time.time() - 3600, time.time() - 3600))
+    open(pend, "w").close(); os.utime(pend, (time.time() - 3600,) * 2)
     run_update(home, make_release(999, NEW, key), shim)
-    check("[%s] U12 stale update.pending -> ROLLED BACK to .prev" % label,
-          open(os.path.join(w, "healer.pyz"), "rb").read() == b"PREV-GOOD")
+    check("[%s] U12 stale marker -> restored from .good" % label,
+          open(os.path.join(w, "healer.pyz"), "rb").read() == b"GOOD-ARTIFACT")
     check("[%s] U12 -> marker cleared so it cannot loop" % label, not os.path.exists(pend))
 
-    # U13 the happy path must still drop the marker for the runner to clear
+    # U13 THE FLAW THIS DESIGN FIXES: a bad build must never BECOME the fallback.
+    # Marker still present and fresh => unproven => no promotion, and no new fetch.
     home, w, st = make_home(pub, fake_python=fake_py("521"))
+    open(os.path.join(w, "healer.pyz.good"), "wb").write(b"GOOD-ARTIFACT")
+    open(os.path.join(st, "update.pending"), "w").close()      # fresh: still proving
     run_update(home, make_release(999, NEW, key), shim)
-    check("[%s] U13 successful update leaves update.pending for the runner" % label,
-          os.path.exists(os.path.join(st, "update.pending")))
+    check("[%s] U13 unproven build is NOT promoted to .good" % label,
+          open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"GOOD-ARTIFACT")
+
+    # U14 a build that DID prove itself (no marker, differs from .good) is promoted
+    home, w, st = make_home(pub, fake_python=fake_py("521"))
+    open(os.path.join(w, "healer.pyz.good"), "wb").write(b"OLDER-GOOD")
+    run_update(home, make_release(999, NEW, key), shim)        # no marker present
+    check("[%s] U14 proven build promoted to .good" % label,
+          open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"INSTALLED-ARTIFACT")
+    check("[%s] U14 -> emits selfupdate.promote" % label,
+          "healer.selfupdate.promote" in events_of(st))
 
 print("=== selfupdate: both fleet generations ===")
 print("  openssl WITH -rawin (pit/pir): %s" % (OSSL_NEW or "ไม่พบ"))

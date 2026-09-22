@@ -1,6 +1,10 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 532 - build identity is now STAMPED at build time (commit +
+Modular package (rev 533 - the update fallback is now the last artifact that PROVED
+itself on the node, not merely the previous one: a build is promoted to .good only
+after it completes a real tick, so a bad build can never become the thing you roll
+back TO (Carey's design);
+rev 532 - build identity is now STAMPED at build time (commit +
 timestamp + dirty flag, surfaced by `--build` and carried on the heartbeat) so a node
 can say WHICH artifact it runs, not just which version number someone typed; and the
 self-updater finally ROLLS BACK - .prev was saved since v520 but never restored;
@@ -53,4 +57,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "532"
+__version__ = "533"

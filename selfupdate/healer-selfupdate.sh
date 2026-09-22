@@ -57,47 +57,54 @@ PYV
 
 
 # ---------------------------------------------------------------------------
-# 5b. POST-INSTALL VERIFICATION + AUTO-ROLLBACK
+# 5b. PROMOTION-BASED ROLLBACK  (Carey's design, v533)
 #
-# Until v532 the .prev copy above was SAVED but never RESTORED - the comment said
-# "keep previous for rollback" and nothing ever rolled back. selftest runs on the
-# NEW artifact BEFORE install, so a broken-on-arrival build is caught; what was not
-# caught is a build that passes selftest and then fails in real operation. Such a
-# node stayed broken forever with a known-good artifact sitting beside it.
+# The fallback is the last artifact that PROVED ITSELF on THIS node - not merely the
+# one that happened to be installed before. That distinction matters: the naive
+# "cp current -> .prev at install time" promotes a bad build to fallback as soon as
+# the NEXT release lands. v531(good) -> v532(bad) leaves .prev=531; but when v533
+# arrives, .prev becomes 532, and a rollback then lands on the broken build.
 #
-# Two gates now:
-#   (a) immediate - re-run selftest against the INSTALLED path. Catches a corrupted
-#       copy/mv and anything environment-specific that only appears once installed.
-#   (b) deferred  - drop update.pending; the runner deletes it after a healthy tick.
-#       If a later self-update run finds it still present and stale, the new build
-#       never completed a single real tick -> roll back.
-# Both restore .prev and fail LOUD (an event), never silently.
+# So: .good is only ever written AFTER the running artifact has demonstrated it works.
+#   install  -> .good untouched, drop update.pending
+#   healthy  -> runner deletes update.pending after a real tick (import+wire+registry
+#               run+heartbeat, which is strictly more than selftest proves)
+#   next run -> marker gone and running != .good  -> PROMOTE  (this build is now the
+#               fallback); marker still there and stale -> ROLLBACK to .good
 # ---------------------------------------------------------------------------
-rollback_to_prev(){   # $1 = reason, $2 = extra json fields (no braces)
-  if [ ! -s "$PYZ.prev" ]; then
-    ev "healer.selfupdate.rollback-impossible" "{\"why\":\"$1\",\"note\":\"no .prev\"}"
-    return 1
-  fi
-  if install -m0644 "$PYZ.prev" "$PYZ.restore" && mv -f "$PYZ.restore" "$PYZ"; then
+GOOD="$PYZ.good"
+# Seed on first run: the artifact currently running is, by definition, one that boots
+# and has been ticking - it is the best evidence available until a promotion happens.
+[ -s "$GOOD" ] || cp -f "$PYZ" "$GOOD" 2>/dev/null
+
+restore_good(){   # $1 = reason, $2 = extra json (no braces)
+  if [ ! -s "$GOOD" ]; then
+    ev "healer.selfupdate.rollback-impossible" "{\"why\":\"$1\",\"note\":\"no .good\"}"; return 1; fi
+  if install -m0644 "$GOOD" "$PYZ.restore" && mv -f "$PYZ.restore" "$PYZ"; then
     rm -f "$STATE/update.pending"
-    PV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
-    ev "healer.selfupdate.rollback" "{\"why\":\"$1\",\"restored\":${PV:-0}${2:+,$2}}"
-    return 0
-  fi
-  ev "healer.selfupdate.rollback-failed" "{\"why\":\"$1\"}"
-  return 1
+    GV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
+    ev "healer.selfupdate.rollback" "{\"why\":\"$1\",\"restored\":${GV:-0}${2:+,$2}}"; return 0; fi
+  ev "healer.selfupdate.rollback-failed" "{\"why\":\"$1\"}"; return 1
 }
 
-# (b) deferred gate - evaluate BEFORE considering a new update, so a bad build is
-#     reverted even if the next release is slow to arrive.
+# Evaluate the PREVIOUS update's outcome before considering a new one.
 if [ -f "$STATE/update.pending" ]; then
   PEND_AGE=$(( $(date +%s) - $(stat -c %Y "$STATE/update.pending" 2>/dev/null || date +%s) ))
-  PEND_MAX="${HEALER_UPDATE_PROVE_S:-900}"      # 15 min = ~15 healer ticks at 60s
+  PEND_MAX="${HEALER_UPDATE_PROVE_S:-900}"      # 15 min ~= 15 healer ticks at 60s
   if [ "$PEND_AGE" -ge "$PEND_MAX" ]; then
-    rollback_to_prev "no-healthy-tick" "\"age_s\":$PEND_AGE"
-    exit 0                                       # settle on the restored build first
+    restore_good "no-healthy-tick" "\"age_s\":$PEND_AGE"
+    exit 0                                       # let the restored build settle first
+  fi
+  # still inside the proving window - do not promote, do not fetch a newer release yet
+  exit 0
+elif ! cmp -s "$PYZ" "$GOOD" 2>/dev/null; then
+  # No pending marker => the running build completed a healthy tick. It has earned it.
+  CV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
+  if install -m0644 "$PYZ" "$GOOD.new" && mv -f "$GOOD.new" "$GOOD"; then
+    ev "healer.selfupdate.promote" "{\"good\":${CV:-0}}"
   fi
 fi
+
 # 1. compare versions (cheap)
 RV="$(curl -fsSL --max-time 20 "$BASE/version" 2>/dev/null | tr -dc '0-9')"
 [ -z "$RV" ] && exit 0
@@ -122,14 +129,16 @@ if ! "$PY" "$TMP/healer.pyz" selftest >/dev/null 2>&1; then
   ev "healer.selfupdate.reject" "{\"why\":\"selftest-failed\",\"rv\":$RV}"; exit 0; fi
 
 # 5. atomic install, keep previous for rollback
-cp -f "$PYZ" "$PYZ.prev" 2>/dev/null
+# NOTE: no ".prev at install" any more - see the promotion gate above.
 if install -m0644 "$TMP/healer.pyz" "$PYZ.new" && mv -f "$PYZ.new" "$PYZ"; then
-  # (a) immediate gate: prove the INSTALLED artifact runs, not just the temp copy
+  # Immediate gate: prove the INSTALLED artifact runs (catches a bad copy/mv and
+  # anything that only breaks once in place). .good is NOT touched here - promotion
+  # happens only after a healthy tick, on the next run.
   if ! "$PY" "$PYZ" selftest >/dev/null 2>&1; then
-    rollback_to_prev "installed-selftest-failed" "\"rv\":$RV"
+    restore_good "installed-selftest-failed" "\"rv\":$RV"
     exit 0
   fi
-  : > "$STATE/update.pending" 2>/dev/null || true   # runner clears it on a healthy tick
+  : > "$STATE/update.pending" 2>/dev/null || true
   ev "healer.selfupdate.ok" "{\"from\":$LV,\"to\":$RV}"
 else
   ev "healer.selfupdate.fail" '{"stage":"install"}'
