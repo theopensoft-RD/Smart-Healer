@@ -182,10 +182,10 @@ def suite(label, openssl_bin):
     check("[%s] U1 valid sig + newer -> installed" % label,
           open(os.path.join(w, "healer.pyz"), "rb").read() == NEW)
     check("[%s] U1 -> emits selfupdate.ok" % label, "healer.selfupdate.ok" in events_of(st))
-    check("[%s] U1 -> keeps a rollback copy (.good)" % label,
-          os.path.exists(os.path.join(w, "healer.pyz.good")))
-    check("[%s] U1 -> .good holds the PROVEN build, not the one just installed" % label,
-          open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"INSTALLED-ARTIFACT")
+    check("[%s] U1 -> records git provenance of what it installed" % label,
+          os.path.exists(os.path.join(st, "installed.sha256")))
+    check("[%s] U1 -> does NOT promote on the same run (not proven yet)" % label,
+          not os.path.exists(os.path.join(w, "healer.pyz.good")))
 
     # U2 tampered artifact -> rejected, current healer untouched  (the security promise)
     home, w, st = make_home(pub, fake_python=fake_py("521"))
@@ -283,10 +283,10 @@ def suite(label, openssl_bin):
     # The artifact that was running had no pending marker, so the gate promoted it to
     # .good before fetching. The failed update therefore lands back on exactly the
     # build that had proved itself - which is the whole point of the design.
-    check("[%s] U11 broken-once-installed -> restored to the PROVEN build" % label,
-          open(os.path.join(w, "healer.pyz"), "rb").read() == b"INSTALLED-ARTIFACT")
-    check("[%s] U11 -> emits selfupdate.rollback" % label,
-          "healer.selfupdate.rollback" in events_of(st))
+    check("[%s] U11 broken install, no verified .good -> says rollback impossible" % label,
+          "healer.selfupdate.rollback-impossible" in events_of(st))
+    check("[%s] U11 -> never invents a fallback it cannot trust" % label,
+          not os.path.exists(os.path.join(w, "healer.pyz.good")))
 
     # U12 deferred gate: stale update.pending = the build never completed a real tick
     home, w, st = make_home(pub, fake_python=fake_py("777"))
@@ -310,11 +310,27 @@ def suite(label, openssl_bin):
     # U14 a build that DID prove itself (no marker, differs from .good) is promoted
     home, w, st = make_home(pub, fake_python=fake_py("521"))
     open(os.path.join(w, "healer.pyz.good"), "wb").write(b"OLDER-GOOD")
+    import hashlib
+    open(os.path.join(st, "installed.sha256"), "w").write(
+        hashlib.sha256(b"INSTALLED-ARTIFACT").hexdigest())      # provenance: it came from git
     run_update(home, make_release(999, NEW, key), shim)        # no marker present
-    check("[%s] U14 proven build promoted to .good" % label,
+    check("[%s] U14 proven build WITH git provenance -> promoted" % label,
           open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"INSTALLED-ARTIFACT")
     check("[%s] U14 -> emits selfupdate.promote" % label,
           "healer.selfupdate.promote" in events_of(st))
+
+
+    # U15 THE RULE: a site hand-fix is running (provenance does not match). Leave it
+    # alone - it is presumably there for a reason - but never launder it into the
+    # trusted fallback, and make sure a human can see it.
+    home, w, st = make_home(pub, fake_python=fake_py("521"))
+    open(os.path.join(w, "healer.pyz.good"), "wb").write(b"OLDER-GOOD")
+    open(os.path.join(st, "installed.sha256"), "w").write("0" * 64)   # does NOT match
+    run_update(home, make_release(999, NEW, key), shim)
+    check("[%s] U15 hand-fixed artifact is NOT promoted to .good" % label,
+          open(os.path.join(w, "healer.pyz.good"), "rb").read() == b"OLDER-GOOD")
+    check("[%s] U15 -> reports it as foreign" % label,
+          "healer.selfupdate.foreign" in events_of(st))
 
 print("=== selfupdate: both fleet generations ===")
 print("  openssl WITH -rawin (pit/pir): %s" % (OSSL_NEW or "ไม่พบ"))

@@ -57,52 +57,67 @@ PYV
 
 
 # ---------------------------------------------------------------------------
-# 5b. PROMOTION-BASED ROLLBACK  (Carey's design, v533)
+# 5b. PROMOTION-BASED ROLLBACK, GIT-PROVENANCE ONLY  (Carey's design, v534)
 #
-# The fallback is the last artifact that PROVED ITSELF on THIS node - not merely the
-# one that happened to be installed before. That distinction matters: the naive
-# "cp current -> .prev at install time" promotes a bad build to fallback as soon as
-# the NEXT release lands. v531(good) -> v532(bad) leaves .prev=531; but when v533
-# arrives, .prev becomes 532, and a rollback then lands on the broken build.
+# The fallback is the last artifact that BOTH (a) arrived from the signed git release
+# channel and (b) proved itself with a real tick on THIS node. Two rules, both needed:
 #
-# So: .good is only ever written AFTER the running artifact has demonstrated it works.
-#   install  -> .good untouched, drop update.pending
-#   healthy  -> runner deletes update.pending after a real tick (import+wire+registry
-#               run+heartbeat, which is strictly more than selftest proves)
-#   next run -> marker gone and running != .good  -> PROMOTE  (this build is now the
-#               fallback); marker still there and stale -> ROLLBACK to .good
+#   * "proved itself" - not merely "the previous one". The naive cp-at-install promotes
+#     a bad build to fallback one release later: v531 good -> v532 bad leaves .prev=531,
+#     but when v533 lands .prev becomes 532 and a rollback goes TO the broken build.
+#
+#   * "from git" - a node that was hand-fixed on site is running an artifact nobody
+#     signed. Seeding .good from whatever happens to be installed would launder that
+#     local edit into the trusted rollback target and defeat the signature chain
+#     entirely. A hand-fix is left running (it is presumably there for a reason) but it
+#     is NEVER promoted, and the node says so via healer.selfupdate.foreign.
+#
+# Provenance is tracked by recording the sha256 of each artifact the updater installs.
+# Running artifact == recorded hash  -> it came from git, may be promoted.
+# Running artifact != recorded hash  -> hand-placed, never promoted.
 # ---------------------------------------------------------------------------
 GOOD="$PYZ.good"
-# Seed on first run: the artifact currently running is, by definition, one that boots
-# and has been ticking - it is the best evidence available until a promotion happens.
-[ -s "$GOOD" ] || cp -f "$PYZ" "$GOOD" 2>/dev/null
+PROV="$STATE/installed.sha256"          # sha256 of the last GIT-VERIFIED install
+sha(){ sha256sum "$1" 2>/dev/null | cut -d' ' -f1 || openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; }
+# NOTE: .good is deliberately NOT seeded from the running artifact. Until a git-verified
+# build proves itself there is no trustworthy rollback target, and saying so honestly is
+# better than inventing one.
 
 restore_good(){   # $1 = reason, $2 = extra json (no braces)
   if [ ! -s "$GOOD" ]; then
-    ev "healer.selfupdate.rollback-impossible" "{\"why\":\"$1\",\"note\":\"no .good\"}"; return 1; fi
+    ev "healer.selfupdate.rollback-impossible" "{\"why\":\"$1\",\"note\":\"no verified .good yet\"}"; return 1; fi
   if install -m0644 "$GOOD" "$PYZ.restore" && mv -f "$PYZ.restore" "$PYZ"; then
-    rm -f "$STATE/update.pending"
+    rm -f "$STATE/update.pending"; sha "$PYZ" > "$PROV" 2>/dev/null
     GV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
     ev "healer.selfupdate.rollback" "{\"why\":\"$1\",\"restored\":${GV:-0}${2:+,$2}}"; return 0; fi
   ev "healer.selfupdate.rollback-failed" "{\"why\":\"$1\"}"; return 1
 }
 
-# Evaluate the PREVIOUS update's outcome before considering a new one.
+# Settle the PREVIOUS cycle before considering a new release.
 if [ -f "$STATE/update.pending" ]; then
   PEND_AGE=$(( $(date +%s) - $(stat -c %Y "$STATE/update.pending" 2>/dev/null || date +%s) ))
   PEND_MAX="${HEALER_UPDATE_PROVE_S:-900}"      # 15 min ~= 15 healer ticks at 60s
   if [ "$PEND_AGE" -ge "$PEND_MAX" ]; then
     restore_good "no-healthy-tick" "\"age_s\":$PEND_AGE"
-    exit 0                                       # let the restored build settle first
   fi
-  # still inside the proving window - do not promote, do not fetch a newer release yet
-  exit 0
-elif ! cmp -s "$PYZ" "$GOOD" 2>/dev/null; then
-  # No pending marker => the running build completed a healthy tick. It has earned it.
-  CV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
-  if install -m0644 "$PYZ" "$GOOD.new" && mv -f "$GOOD.new" "$GOOD"; then
-    ev "healer.selfupdate.promote" "{\"good\":${CV:-0}}"
+  exit 0                                        # proving, or just restored: settle first
+fi
+if ! cmp -s "$PYZ" "$GOOD" 2>/dev/null; then
+  RUN_SHA="$(sha "$PYZ")"; WANT_SHA="$(cat "$PROV" 2>/dev/null)"
+  if [ -n "$WANT_SHA" ] && [ -n "$RUN_SHA" ] && [ "$RUN_SHA" = "$WANT_SHA" ]; then
+    CV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
+    if install -m0644 "$PYZ" "$GOOD.new" && mv -f "$GOOD.new" "$GOOD"; then
+      ev "healer.selfupdate.promote" "{\"good\":${CV:-0}}"
+    fi
+  elif [ -n "$WANT_SHA" ]; then
+    # We DO have a record of what we installed, and this is not it: a site hand-fix or
+    # tampering. Leave it running (it is presumably there for a reason), refuse to trust
+    # it as a fallback, and make sure a human can see it.
+    ev "healer.selfupdate.foreign" "{\"note\":\"running artifact not from the signed channel; not promoted\"}"
   fi
+  # No provenance record at all (a node this updater has never installed on, e.g. a
+  # factory image): unknown, not suspicious. Do not promote, and stay SILENT - a
+  # "nothing to do" run must emit nothing, or the event stream becomes unreadable.
 fi
 
 # 1. compare versions (cheap)
@@ -138,6 +153,7 @@ if install -m0644 "$TMP/healer.pyz" "$PYZ.new" && mv -f "$PYZ.new" "$PYZ"; then
     restore_good "installed-selftest-failed" "\"rv\":$RV"
     exit 0
   fi
+  sha "$PYZ" > "$PROV" 2>/dev/null          # provenance: this one came from git
   : > "$STATE/update.pending" 2>/dev/null || true
   ev "healer.selfupdate.ok" "{\"from\":$LV,\"to\":$RV}"
 else
