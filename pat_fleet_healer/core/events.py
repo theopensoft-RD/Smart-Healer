@@ -118,7 +118,10 @@ def emit(cfg, code, fields=None, push=None):
             ok = mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
                               "fleet/events/%s" % cfg.node_id, line, cfg.node_id,
                               username=getattr(cfg, "mqtt_username", "") or None,
-                              password=getattr(cfg, "mqtt_password", "") or None)
+                              password=getattr(cfg, "mqtt_password", "") or None,
+                              ca=getattr(cfg, "mqtt_ca", "") or None,
+                              cert=getattr(cfg, "mqtt_cert", "") or None,
+                              key=getattr(cfg, "mqtt_key", "") or None)
         except Exception:
             ok = False
         _record_push(cfg, ok)

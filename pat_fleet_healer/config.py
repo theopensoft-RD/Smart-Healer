@@ -26,11 +26,28 @@ class Config:
         # retired one. A bad value must not crash the tick.
         self.mqtt_port   = self._int(self.env.get("MQTT_PORT") or o.get("MQTT_PORT"), 1883)
         # Optional broker credentials. Empty = anonymous, byte-identical to pre-v530.
-        # The healer's transport is a hand-rolled QoS-0 publisher on a raw socket and
-        # CANNOT do TLS, so username/password is its only way to authenticate once the
-        # broker drops allow_anonymous. Never logged, never put in an event payload.
+        # This is how the healer authenticates once the broker drops allow_anonymous.
+        # It works on the PLAIN listener and needs no certificate, so it stays the
+        # simplest path even now that v531 can also do TLS.
+        # Never logged, never put in an event payload.
         self.mqtt_username = self.env.get("MQTT_USERNAME") or o.get("MQTT_USERNAME") or ""
         self.mqtt_password = self.env.get("MQTT_PASSWORD") or o.get("MQTT_PASSWORD") or ""
+        # Mutual-TLS material (v531). SAME key names as the station workers, because on a
+        # station the healer and the workers read the SAME ~/.config/pat-smart/.env -
+        # one file, one switch, both flip together. Before v531 the healer could not do
+        # TLS at all, so moving MQTT_PORT to 8883 for the workers killed healer telemetry
+        # fleet-wide; that deadlock is what this removes.
+        # TLS engages only when a CA is set AND every configured file exists (same
+        # conditional shape as the workers), so a half-provisioned node stays plaintext
+        # instead of failing every push.
+        self.mqtt_ca   = self.env.get("MQTT_CA") or o.get("MQTT_CA") or ""
+        self.mqtt_cert = self.env.get("MQTT_CERT") or o.get("MQTT_CERT") or ""
+        self.mqtt_key  = self.env.get("MQTT_PRIVATE_KEY") or o.get("MQTT_PRIVATE_KEY") or ""
+        if not (self.mqtt_ca and os.path.exists(self.mqtt_ca)):
+            self.mqtt_ca = self.mqtt_cert = self.mqtt_key = ""
+        elif not (self.mqtt_cert and self.mqtt_key
+                  and os.path.exists(self.mqtt_cert) and os.path.exists(self.mqtt_key)):
+            self.mqtt_cert = self.mqtt_key = ""      # server-auth only; no client cert
         # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
         self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 

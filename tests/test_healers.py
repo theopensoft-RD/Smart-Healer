@@ -1250,7 +1250,19 @@ class FakeBroker(object):
             else:
                 c.sendall(bytes(bytearray([0x20, 0x02, 0x00, self.rc])))
             if self.rc == 0:
-                self.publish_pkt = c.recv(65536)
+                # Drain until the client closes. PUBLISH and DISCONNECT are two
+                # separate sendall() calls, so a single recv() may return only the
+                # PUBLISH - a TCP coalescing race that made "M4 DISCONNECT follows
+                # the publish" flaky (it failed ~1 run in 3 on v530, and a release
+                # gate that lies is worse than none). Reading to EOF is
+                # deterministic; the client always closes after DISCONNECT.
+                buf = b""
+                while True:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                self.publish_pkt = buf
             c.close()
         except Exception:
             pass
@@ -1387,6 +1399,31 @@ check("M39 CONNACK rc=4 (bad user/password) -> False, no raise",
 check("M40 CONNACK rc=5 (not authorized) -> False, no raise",
       _mqtt.publish("127.0.0.1", FakeBroker(connack_rc=5).port, "t", "x", "CID",
                     username="u", password="p") is False)
+
+# ---- config + wire: TLS material (v531) -----------------------------------
+# The healer shares ~/.config/pat-smart/.env with the station workers, so it uses the
+# SAME key names (MQTT_CA / MQTT_CERT / MQTT_PRIVATE_KEY). Before v531 it could not do
+# TLS at all, which is what made moving MQTT_PORT to 8883 a fleet-wide deadlock.
+check("M41 no TLS material by default",
+      Config(env_path=os.devnull, overrides={}).mqtt_ca == "")
+_tlsdir = tempfile.mkdtemp(); _TMP.append(_tlsdir)
+_fake_ca = os.path.join(_tlsdir, "ca.pem"); open(_fake_ca, "w").write("x")
+_w = lambda body: open(_envf, "w").write(body)
+_w("MQTT_CA=" + _fake_ca + "\n")
+check("M42 CA alone -> server-auth TLS, no client cert",
+      Config(env_path=_envf, overrides={}).mqtt_ca == _fake_ca
+      and Config(env_path=_envf, overrides={}).mqtt_cert == "")
+_w("MQTT_CA=/nope/missing.pem\n")
+check("M43 CA path that does not exist -> TLS stays OFF (half-provisioned node stays plaintext)",
+      Config(env_path=_envf, overrides={}).mqtt_ca == "")
+_w("MQTT_CA=" + _fake_ca + "\nMQTT_CERT=/nope/c.pem\nMQTT_PRIVATE_KEY=/nope/k.pem\n")
+check("M44 missing client cert/key -> server-auth only, CA still on",
+      Config(env_path=_envf, overrides={}).mqtt_ca == _fake_ca
+      and Config(env_path=_envf, overrides={}).mqtt_cert == "")
+check("M45 plaintext path unchanged when no TLS configured",
+      _mqtt.publish("127.0.0.1", FakeBroker().port, "t", "x", "CID") is True)
+check("M46 TLS requested against a PLAINTEXT broker -> False, no raise, no silent downgrade",
+      _mqtt.publish("127.0.0.1", FakeBroker().port, "t", "x", "CID", ca=_fake_ca) is False)
 
 # ---- integration: emit / heartbeat / escalate ------------------------------
 def mqctx(ok=True):

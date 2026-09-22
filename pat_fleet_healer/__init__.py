@@ -1,6 +1,13 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 530 - the publisher can authenticate: optional MQTT_USERNAME/
+Modular package (rev 531 - the publisher can speak TLS: optional MQTT_CA /
+MQTT_CERT / MQTT_PRIVATE_KEY, the SAME key names the station workers use, because
+on a station the healer reads the workers' .env. Before this the healer could not do
+TLS, so moving MQTT_PORT to 8883 for the workers would have killed healer telemetry
+fleet-wide - the deadlock that blocked the whole cert rollout. Verification is strict
+and there is no plaintext fallback; with no CA configured the behaviour is identical
+to rev 530;
+rev 530 - the publisher can authenticate: optional MQTT_USERNAME/
 MQTT_PASSWORD in the CONNECT packet, so the healer survives the broker dropping
 allow_anonymous. It cannot use TLS (raw socket, no ssl), so user/pass is its ONLY
 auth path; with no credentials set the CONNECT is byte-identical to rev 529;
@@ -42,4 +49,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "530"
+__version__ = "531"

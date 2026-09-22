@@ -15,6 +15,9 @@ def escalate(cfg, healer, verdict, ev=None):
     if not mqtt.publish(cfg.mqtt_host, cfg.mqtt_port,
                         "healer/%s/escalate" % cfg.device_id, payload, cfg.node_id,
                         username=getattr(cfg, "mqtt_username", "") or None,
-                        password=getattr(cfg, "mqtt_password", "") or None):
+                        password=getattr(cfg, "mqtt_password", "") or None,
+                        ca=getattr(cfg, "mqtt_ca", "") or None,
+                        cert=getattr(cfg, "mqtt_cert", "") or None,
+                        key=getattr(cfg, "mqtt_key", "") or None):
         log(cfg, "escalate-publish-failed (%s:%s) - logged only"
                  % (cfg.mqtt_host, cfg.mqtt_port))

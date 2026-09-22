@@ -18,8 +18,9 @@ BROKER FACTS - current (overlay, since 2026-09-21):
   Every node publishes to the OVERLAY VIP 10.0.4.80 (NetBird wt0):
   port 1883  -> PLAIN MQTT, accepted, no credentials required (this is the default).
   port 8883  -> the broker's REAL TLS listener; it RESETS a plaintext CONNECT.
-  So on the overlay a node left on 8883 fails EVERY publish - the opposite of the
-  old public path. No TLS is attempted by this module.
+  So on the overlay a node left on 8883 fails EVERY publish UNLESS TLS material is
+  configured - the opposite of the old public path. Since v531 this module CAN speak
+  TLS (see publish()'s ca/cert/key); it stays plaintext until a CA file is configured.
 
 BROKER FACTS - historical (public NAT, measured pit003 -> mqtt.pattaya-smart-sanitary.com, 2026-08-05):
   port 1883  -> timeout (closed).
@@ -30,6 +31,7 @@ BROKER FACTS - historical (public NAT, measured pit003 -> mqtt.pattaya-smart-san
 This module MUST NOT raise: its caller is an event emitter, not a transport.
 """
 import socket
+import ssl
 import struct
 
 CONNECT, CONNACK, PUBLISH, DISCONNECT = 0x10, 0x20, 0x30, 0xE0
@@ -66,7 +68,7 @@ def _recv_exactly(sock, n):
 
 
 def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0,
-            username=None, password=None):
+            username=None, password=None, ca=None, cert=None, key=None):
     """Publish ONE QoS-0 message.
 
     Returns True only if the broker sent CONNACK with return code 0 AND the
@@ -79,6 +81,18 @@ def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0,
     None/empty the CONNECT is byte-identical to the pre-v530 anonymous one, so this
     is inert until credentials are actually configured. Per the spec a password
     MUST NOT be sent without a username, so password alone is ignored.
+
+    ca/cert/key are optional mutual-TLS material (v531). TLS is attempted only when
+    `ca` is given; `cert`+`key` add a client certificate. Uses the SAME env var names
+    as the station workers (MQTT_CA / MQTT_CERT / MQTT_PRIVATE_KEY) so ONE .env drives
+    both and they switch together - the healer sharing the workers' .env was what made
+    the station cert rollout a deadlock before this.
+
+    Verification is strict (check_hostname + CERT_REQUIRED). `host` is normally the
+    literal broker IP, which Python matches against the certificate's IP SAN, so the
+    broker cert MUST carry an IP SAN for it. There is deliberately NO fallback to
+    plaintext on TLS failure: silently downgrading would be worse than a failed push,
+    and a failed push is already visible as a rising pfail in push.state.
     """
     sock = None
     try:
@@ -86,6 +100,17 @@ def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0,
             payload = payload.encode("utf-8")
         sock = socket.create_connection((host, int(port)), timeout)
         sock.settimeout(timeout)
+
+        if ca:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.check_hostname = True
+            ctx.load_verify_locations(ca)
+            if cert and key:
+                ctx.load_cert_chain(cert, key)
+            # server_hostname may be an IP; python matches it against the cert's IP SAN
+            sock = ctx.wrap_socket(sock, server_hostname=str(host))
+            sock.settimeout(timeout)
 
         # CONNECT: protocol "MQTT" level 4. Flags: 0x02 clean session, +0x80 username,
         # +0x40 password. Credential fields go at the END of the payload, after the
