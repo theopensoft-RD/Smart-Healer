@@ -4,7 +4,10 @@
     python3 healer.pyz selftest     -> DRY tick into a throwaway state dir; exit 0 iff
                                        the artifact imports+wires+runs (the self-update
                                        gate: a new pyz must pass this before it installs)
-    python3 healer.pyz --version    -> print the version
+    python3 healer.pyz --version    -> print the version (plain digits; the self-update
+                                       script parses it with tr -dc, do not change the format)
+    python3 healer.pyz --build      -> which ARTIFACT this is: version+gCOMMIT, build time,
+                                       dirty flag. Two builds can share a version number.
 """
 import sys
 

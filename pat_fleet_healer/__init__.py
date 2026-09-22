@@ -1,6 +1,10 @@
 """pat-fleet-healer - node-local self-healing agent (ADR-037).
 
-Modular package (rev 534 - the rollback target must come from the SIGNED GIT CHANNEL:
+Modular package (rev 535 - documentation caught up with the code: the self-update
+event codes are in the manifest at last (they are written by the shell script, so they
+were never decodable), d.build is described on the heartbeat, --build is in the help,
+and the stale "keep previous for rollback" comment is gone;
+rev 534 - the rollback target must come from the SIGNED GIT CHANNEL:
 a site hand-fix is left running but never laundered into .good, and provenance is
 tracked by the sha256 of each artifact the updater installed (Carey's rule);
 rev 533 - the update fallback is now the last artifact that PROVED
@@ -60,4 +64,4 @@ Architecture:
   healers/registry.py  - ordered registry (dependency-first run order)
   runner.run()         - the engine: build ctx, run registry, per-healer isolation
 """
-__version__ = "534"
+__version__ = "535"

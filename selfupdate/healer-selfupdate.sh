@@ -108,6 +108,7 @@ if ! cmp -s "$PYZ" "$GOOD" 2>/dev/null; then
     CV="$("$PY" "$PYZ" --version 2>/dev/null | tr -dc '0-9')"
     if install -m0644 "$PYZ" "$GOOD.new" && mv -f "$GOOD.new" "$GOOD"; then
       ev "healer.selfupdate.promote" "{\"good\":${CV:-0}}"
+      rm -f "$PYZ.prev"          # orphaned by pre-v533 scripts; .good replaces it
     fi
   elif [ -n "$WANT_SHA" ]; then
     # We DO have a record of what we installed, and this is not it: a site hand-fix or
@@ -143,8 +144,9 @@ if [ "$VRC" != 0 ]; then
 if ! "$PY" "$TMP/healer.pyz" selftest >/dev/null 2>&1; then
   ev "healer.selfupdate.reject" "{\"why\":\"selftest-failed\",\"rv\":$RV}"; exit 0; fi
 
-# 5. atomic install, keep previous for rollback
-# NOTE: no ".prev at install" any more - see the promotion gate above.
+# 5. atomic install. NOTE: nothing is copied to .prev here any more - the fallback
+#    (.good) is written only by the promotion gate above, and only for an artifact
+#    that both proved itself AND came from the signed git channel.
 if install -m0644 "$TMP/healer.pyz" "$PYZ.new" && mv -f "$PYZ.new" "$PYZ"; then
   # Immediate gate: prove the INSTALLED artifact runs (catches a bad copy/mv and
   # anything that only breaks once in place). .good is NOT touched here - promotion

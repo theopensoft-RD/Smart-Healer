@@ -13,8 +13,25 @@ SCHEMA_VERSION = 1
 
 CODES = {
     # --- agent / engine ---
-    "agent.alive":   {"sev": "info",  "desc": "heartbeat (proof-of-life). d.push, when present, is the outcome of the PREVIOUS central MQTT push: 1 = a broker accepted it, 0 = it reached none; d.pfail counts consecutive failures. ABSENT means no push has ever been attempted - that is 'not measured', NOT zero",
+    "agent.alive":   {"sev": "info",  "desc": "heartbeat (proof-of-life). d.push, when present, is the outcome of the PREVIOUS central MQTT push: 1 = a broker accepted it, 0 = it reached none; d.pfail counts consecutive failures. ABSENT means no push has ever been attempted - that is 'not measured', NOT zero. d.build is the stamped build identity (version+gCOMMIT): two artifacts can carry the same version number, so d.sw alone does not identify what is running",
                       "cause": "normal", "fix": "d.push=0 with a rising d.pfail = the node is healing but the centre never hears about it: check MQTT_HOST/MQTT_PORT in .env (the overlay broker 10.0.4.80 is PLAIN on 1883; 8883 there is the real TLS listener and RESETS a plaintext publish) and that the node's NetBird overlay (wt0) is up"},
+    # --- self-update (emitted by healer-selfupdate.sh writing events.jsonl directly,
+    #     not through emit(); documented here so the manifest can still decode them) ---
+    "healer.selfupdate.ok":       {"sev": "info", "desc": "a signed artifact was verified, self-tested and installed (d.from -> d.to). Unproven until a healthy tick clears update.pending",
+                                   "cause": "normal", "fix": "none"},
+    "healer.selfupdate.reject":   {"sev": "warn", "desc": "an update was refused BEFORE touching the running build (d.why: bad-signature | no-verifier | selftest-failed)",
+                                   "cause": "bad-signature = tampering or a mis-signed release; no-verifier = this node cannot check signatures (missing python-cryptography), an operator problem NOT evidence of tampering",
+                                   "fix": "bad-signature: re-sign and re-publish. no-verifier: install python3-cryptography on the node"},
+    "healer.selfupdate.fail":     {"sev": "warn", "desc": "an update attempt failed at d.stage (download | sig | install)",
+                                   "cause": "network, GitHub, or a full/read-only filesystem", "fix": "usually self-clears next run; check disk if it persists"},
+    "healer.selfupdate.promote":  {"sev": "info", "desc": "d.good became the rollback target: it completed a real tick AND its sha256 matched what the updater installed",
+                                   "cause": "normal", "fix": "none"},
+    "healer.selfupdate.rollback": {"sev": "error", "desc": "restored .good after a failed update (d.why: installed-selftest-failed | no-healthy-tick). d.restored is the version now running",
+                                   "cause": "the new build passed the pre-install gate then failed in place", "fix": "look at the build named in the preceding selfupdate.ok; do not re-publish it"},
+    "healer.selfupdate.rollback-impossible": {"sev": "error", "desc": "a rollback was needed but no verified .good exists yet on this node",
+                                   "cause": "no git-verified build has completed a healthy tick here yet", "fix": "the node may be stuck on a bad build - check it by hand"},
+    "healer.selfupdate.foreign":  {"sev": "warn", "desc": "the running artifact is not the one the updater installed: a site hand-fix, or tampering. Left running, never promoted",
+                                   "cause": "someone replaced healer.pyz by hand on site", "fix": "intended? fold the change into a release. unexpected? treat as tampering"},
     "agent.log":     {"sev": "debug", "desc": "free-text action log (transitional; carries d.msg)",
                       "cause": "informational", "fix": "none"},
     "agent.exc":     {"sev": "error", "desc": "a healer raised an exception (isolated; tick continued)",
