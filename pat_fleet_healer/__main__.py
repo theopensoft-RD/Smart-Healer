@@ -14,6 +14,14 @@ def main():
     if arg == "collect":
         from .tools.collect import main as collect_main
         collect_main()
+    elif arg in ("--build", "build-info"):
+        # WHICH artifact is this, not just which version number someone typed.
+        from . import __version__, buildinfo
+        print("version  %s" % __version__)
+        print("build    %s" % buildinfo.describe(__version__))
+        print("commit   %s" % buildinfo.COMMIT)
+        print("built_at %s" % buildinfo.BUILT_AT)
+        print("dirty    %s" % buildinfo.DIRTY)
     elif arg == "selftest":
         import os
         import tempfile

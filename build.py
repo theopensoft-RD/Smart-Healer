@@ -8,6 +8,7 @@ the systemd unit runs `python3 healer.pyz`). Deterministic: __pycache__ excluded
 Usage:  python3 build.py            # -> ./healer.pyz
         python3 build.py --check    # build to a temp file + smoke-run it (DRY)
 """
+import datetime
 import os
 import sys
 import shutil
@@ -27,6 +28,30 @@ def _filter(path):
     return "__pycache__" not in parts and not path.name.endswith(".pyc")
 
 
+def _stamp_buildinfo(path):
+    """Write the real commit/timestamp into the STAGED copy only.
+
+    Stamping the staging copy (not the source tree) keeps `git status` clean and keeps
+    the build reproducible for a given commit. A dirty worktree is recorded as such
+    rather than hidden - an artifact built from uncommitted code should say so.
+    """
+    def _git(*a):
+        try:
+            return subprocess.run(["git", *a], cwd=HERE, capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+        except Exception:
+            return ""
+    commit = _git("rev-parse", "--short", "HEAD") or "unknown"
+    dirty = bool(_git("status", "--porcelain"))
+    built = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    src = src.replace('COMMIT = "unstamped"', 'COMMIT = "%s"' % commit, 1)
+    src = src.replace('BUILT_AT = "unstamped"', 'BUILT_AT = "%s"' % built, 1)
+    src = src.replace('DIRTY = None', 'DIRTY = %r' % dirty, 1)
+    with open(path, "w", encoding="utf-8", newline=chr(10)) as f:
+        f.write(src)
+    print("stamped build identity: %s%s @ %s" % (commit, "-dirty" if dirty else "", built))
 def build(out=OUT):
     if not os.path.isdir(SRC):
         print("ERR: source package not found: %s" % SRC)
@@ -37,6 +62,7 @@ def build(out=OUT):
     try:
         pkg_dst = os.path.join(staging, "pat_fleet_healer")
         shutil.copytree(SRC, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        _stamp_buildinfo(os.path.join(pkg_dst, "buildinfo.py"))
         # a top-level __main__.py that delegates to the package dispatch (tick | collect)
         with open(os.path.join(staging, "__main__.py"), "w") as f:
             f.write("from pat_fleet_healer.__main__ import main\nmain()\n")

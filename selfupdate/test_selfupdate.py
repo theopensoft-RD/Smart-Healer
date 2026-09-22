@@ -11,6 +11,7 @@ Run:  python3 selfupdate/test_selfupdate.py            (from the repo root)
 """
 import os
 import sys
+import time
 import shutil
 import stat
 import subprocess
@@ -150,6 +151,23 @@ esac
 """ % (version, selftest_rc, probe, sys.executable)
 
 
+
+
+def fake_py_installed_fail(version="999"):
+    """selftest PASSES from a temp path but FAILS from the installed workers path.
+
+    This is the shape the immediate rollback gate exists for: an artifact that clears
+    the pre-install check and is broken only once it is in place. A single fixed
+    selftest_rc (as fake_py uses) cannot express it.
+    """
+    return """#!/bin/bash
+case "$*" in
+  *--version*) echo "%s" ;;
+  *selftest*)  case "$*" in *workers/healer.pyz*) exit 1 ;; *) exit 0 ;; esac ;;
+  *) exec %s "$@" ;;
+esac
+""" % (version, sys.executable)
+
 def suite(label, openssl_bin):
     """The whole contract, run against ONE openssl generation."""
     shim = shim_path(openssl_bin)
@@ -251,6 +269,36 @@ def suite(label, openssl_bin):
     check("[%s] U10 no DEVICE_ID -> event still names the node" % label,
           '"n":""' not in ev and "healer.selfupdate.ok" in ev)
 
+
+
+    # ---- U11/U12: AUTO-ROLLBACK (v532). Until then .prev was SAVED but never
+    # RESTORED, so a build that passed the pre-install selftest and then failed in
+    # real operation left the node broken forever with a good artifact beside it.
+    # U11 immediate gate: passes selftest from /tmp, fails once installed -> roll back
+    home, w, st = make_home(pub, fake_python=fake_py_installed_fail("521"))
+    run_update(home, make_release(999, NEW, key), shim)
+    check("[%s] U11 broken-once-installed -> ROLLED BACK" % label,
+          open(os.path.join(w, "healer.pyz"), "rb").read() == b"INSTALLED-ARTIFACT")
+    check("[%s] U11 -> emits selfupdate.rollback" % label,
+          "healer.selfupdate.rollback" in events_of(st))
+
+    # U12 deferred gate: a stale update.pending means the new build never completed a
+    # real tick (the runner deletes that marker after a healthy one) -> roll back
+    home, w, st = make_home(pub, fake_python=fake_py("777"))
+    open(os.path.join(w, "healer.pyz.prev"), "wb").write(b"PREV-GOOD")
+    pend = os.path.join(st, "update.pending")
+    open(pend, "w").close()
+    os.utime(pend, (time.time() - 3600, time.time() - 3600))
+    run_update(home, make_release(999, NEW, key), shim)
+    check("[%s] U12 stale update.pending -> ROLLED BACK to .prev" % label,
+          open(os.path.join(w, "healer.pyz"), "rb").read() == b"PREV-GOOD")
+    check("[%s] U12 -> marker cleared so it cannot loop" % label, not os.path.exists(pend))
+
+    # U13 the happy path must still drop the marker for the runner to clear
+    home, w, st = make_home(pub, fake_python=fake_py("521"))
+    run_update(home, make_release(999, NEW, key), shim)
+    check("[%s] U13 successful update leaves update.pending for the runner" % label,
+          os.path.exists(os.path.join(st, "update.pending")))
 
 print("=== selfupdate: both fleet generations ===")
 print("  openssl WITH -rawin (pit/pir): %s" % (OSSL_NEW or "ไม่พบ"))
