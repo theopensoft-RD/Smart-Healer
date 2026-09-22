@@ -1410,16 +1410,21 @@ _tlsdir = tempfile.mkdtemp(); _TMP.append(_tlsdir)
 _fake_ca = os.path.join(_tlsdir, "ca.pem"); open(_fake_ca, "w").write("x")
 _w = lambda body: open(_envf, "w").write(body)
 _w("MQTT_CA=" + _fake_ca + "\n")
-check("M42 CA alone -> server-auth TLS, no client cert",
-      Config(env_path=_envf, overrides={}).mqtt_ca == _fake_ca
-      and Config(env_path=_envf, overrides={}).mqtt_cert == "")
+check("M42 CA ALONE -> TLS stays OFF (matches the workers; broker needs a client cert)",
+      Config(env_path=_envf, overrides={}).mqtt_ca == "")
 _w("MQTT_CA=/nope/missing.pem\n")
 check("M43 CA path that does not exist -> TLS stays OFF (half-provisioned node stays plaintext)",
       Config(env_path=_envf, overrides={}).mqtt_ca == "")
+_fake_cert = os.path.join(_tlsdir, "c.pem"); open(_fake_cert, "w").write("x")
+_fake_key  = os.path.join(_tlsdir, "k.pem"); open(_fake_key, "w").write("x")
 _w("MQTT_CA=" + _fake_ca + "\nMQTT_CERT=/nope/c.pem\nMQTT_PRIVATE_KEY=/nope/k.pem\n")
-check("M44 missing client cert/key -> server-auth only, CA still on",
+check("M44 cert/key configured but MISSING on disk -> TLS OFF, not a half state",
+      Config(env_path=_envf, overrides={}).mqtt_ca == "")
+_w("MQTT_CA=" + _fake_ca + "\nMQTT_CERT=" + _fake_cert + "\nMQTT_PRIVATE_KEY=" + _fake_key + "\n")
+check("M44b all three present -> mutual TLS engages",
       Config(env_path=_envf, overrides={}).mqtt_ca == _fake_ca
-      and Config(env_path=_envf, overrides={}).mqtt_cert == "")
+      and Config(env_path=_envf, overrides={}).mqtt_cert == _fake_cert
+      and Config(env_path=_envf, overrides={}).mqtt_key == _fake_key)
 check("M45 plaintext path unchanged when no TLS configured",
       _mqtt.publish("127.0.0.1", FakeBroker().port, "t", "x", "CID") is True)
 check("M46 TLS requested against a PLAINTEXT broker -> False, no raise, no silent downgrade",

@@ -37,17 +37,19 @@ class Config:
         # one file, one switch, both flip together. Before v531 the healer could not do
         # TLS at all, so moving MQTT_PORT to 8883 for the workers killed healer telemetry
         # fleet-wide; that deadlock is what this removes.
-        # TLS engages only when a CA is set AND every configured file exists (same
-        # conditional shape as the workers), so a half-provisioned node stays plaintext
-        # instead of failing every push.
+        # TLS engages only when ALL THREE files are set AND exist - byte-for-byte the
+        # same condition the workers use (PR #19: `all(certs) and all(exists)`), so on a
+        # station the two clients flip together off the one shared .env. Do NOT relax
+        # this to "CA alone -> server-auth TLS": the broker runs REQUIRE_CERTIFICATE=on
+        # and would refuse a client with no certificate, so a lone CA file would take
+        # the healer offline while the workers happily stayed plaintext - a silent
+        # divergence visible only as a rising pfail. Half-provisioned stays plaintext.
         self.mqtt_ca   = self.env.get("MQTT_CA") or o.get("MQTT_CA") or ""
         self.mqtt_cert = self.env.get("MQTT_CERT") or o.get("MQTT_CERT") or ""
         self.mqtt_key  = self.env.get("MQTT_PRIVATE_KEY") or o.get("MQTT_PRIVATE_KEY") or ""
-        if not (self.mqtt_ca and os.path.exists(self.mqtt_ca)):
+        _tls = (self.mqtt_ca, self.mqtt_cert, self.mqtt_key)
+        if not (all(_tls) and all(os.path.exists(p) for p in _tls)):
             self.mqtt_ca = self.mqtt_cert = self.mqtt_key = ""
-        elif not (self.mqtt_cert and self.mqtt_key
-                  and os.path.exists(self.mqtt_cert) and os.path.exists(self.mqtt_key)):
-            self.mqtt_cert = self.mqtt_key = ""      # server-auth only; no client cert
         # uplink class: robustel (RPi5+Robustel) | ec25 (IRIV internal Quectel EC25) | none ; "auto" = detect
         self.uplink      = (self.env.get("UPLINK") or o.get("UPLINK") or "auto").lower()
 
