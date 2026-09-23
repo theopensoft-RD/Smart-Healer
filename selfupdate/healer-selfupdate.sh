@@ -25,14 +25,22 @@ ENVF="$HOME/.config/pat-smart/.env"
 PY="$HOME/.local/share/pipx/venvs/pat-smart/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3 || echo /usr/bin/python3)"
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+# Worker OTA (Dashboard-Hardware ota/workers-selfupdate.sh) piggybacks on this timer: one file copy,
+# no new unit, no root. It runs on EVERY exit path of this script (this script exits early in the
+# common "nothing new" case, so a line at the end would never run), and AFTER this script settled,
+# so the healer and the workers never update in the same tick (the workers updater defers while
+# update.pending exists). Nothing happens when the file is absent.
+trap 'rm -rf "$TMP"; [ -x "$W/workers-selfupdate.sh" ] && "$W/workers-selfupdate.sh" || true' EXIT
 NID="$(grep -m1 '^DEVICE_ID' "$ENVF" 2>/dev/null | cut -d= -f2)"
 [ -n "$NID" ] || NID="$(hostname)"          # signage/infra nodes have no DEVICE_ID
 # stdout goes to journald: an event still reaches a human when the state dir is
 # unwritable (that failure mode hid 649 aborted remediations on 4 nodes for months)
-ev(){ printf '%s [selfupdate] %s %s\n' "$(date +%FT%T%z)" "$1" "${2:-{}}" >&2
+ev(){ local d="${2:-}"; [ -n "$d" ] || d='{}'   # NOT "${2:-{}}": bash closes that at the first '}' and appended a
+      # stray brace to every event that carried data, so those lines were not JSON (10 of 4061 on PIT003, 2026-09-23)
+      printf '%s [selfupdate] %s %s\n' "$(date +%FT%T%z)" "$1" "$d" >&2
       { mkdir -p "$STATE" && printf '{"t":%s,"n":"%s","e":"%s","d":%s}\n' \
-        "$(date +%s)" "$NID" "$1" "${2:-{}}" >> "$STATE/events.jsonl"; } 2>/dev/null || true; }
+        "$(date +%s)" "$NID" "$1" "$d" >> "$STATE/events.jsonl"; } 2>/dev/null || true; }
 
 # ed25519 verify. 0 = good, 1 = BAD signature, 2 = no verifier on this node.
 # openssl first (unchanged fast path for the 58 RPi5 nodes); python-cryptography is
