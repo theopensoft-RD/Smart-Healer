@@ -350,6 +350,31 @@ if OSSL_NEW:
 if OSSL_OLD:
     suite("no-rawin", OSSL_OLD)
 
+# H2 the worker-OTA hook: the workers updater must run on the EARLY-EXIT path too (the common
+# "no new healer release" case), and must not run when the file is absent. Generation-independent.
+_key = Ed25519PrivateKey.generate()
+_pub = _key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+_home, _w, _st = make_home(_pub, fake_python=fake_py("521"))
+_stub = os.path.join(_w, "workers-selfupdate.sh")
+open(_stub, "w").write('#!/bin/bash\necho ran > "$HOME/.hook-ran"\n')
+os.chmod(_stub, 0o755)
+_shim = shim_path(OSSL_OLD or OSSL_NEW or shutil.which("openssl"))
+run_update(_home, "file://" + mktmp() + "/nothing", _shim)          # RV empty -> exit 0 early
+check("H2 hook runs workers-selfupdate.sh on the early-exit path", os.path.exists(os.path.join(_home, ".hook-ran")))
+check("H2 early exit stays silent (no events)", events_of(_st).strip() == "")
+os.remove(_stub); os.remove(os.path.join(_home, ".hook-ran"))
+run_update(_home, "file://" + mktmp() + "/nothing", _shim)
+check("H2 no hook file -> nothing runs, no error", not os.path.exists(os.path.join(_home, ".hook-ran")))
+# H3 events with data are valid JSON (the "${2:-{}}" stray brace, fixed 2026-09-23)
+import json as _json
+_home, _w, _st = make_home(_pub, fake_python=fake_py("521"))
+run_update(_home, make_release(999, b"NEW", _key, corrupt_sig=True), _shim)
+_lines = [l for l in events_of(_st).splitlines() if l.strip()]
+def _ok(l):
+    try: _json.loads(l); return True
+    except Exception: return False
+check("H3 every event line is valid JSON", bool(_lines) and all(_ok(l) for l in _lines))
+
 for d in TMPS:
     shutil.rmtree(d, ignore_errors=True)
 print("\n=== RESULTS ===")
