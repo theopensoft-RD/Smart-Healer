@@ -19,10 +19,15 @@ from .base import Healer
 _S = "loop"
 LOOP_MIN_MA = 3.8
 LOOP_MAX_MA = 20.5
-# the cell is the text between the LAST "Stromeingang" label and its "mA" unit (the page repeats the
-# label as a section heading above the table: " Stromeingang Eingang Wert Einheit Stromeingang 7,044 mA ")
-_CELL = re.compile(r"Stromeingang\s+((?:(?!Stromeingang).)*?)\s*mA\b", re.S)
-_NUM = re.compile(r"^[0-9]+[.,][0-9]+$")                  # German decimal comma on the VEGAMET 391
+# the cell is the text between the LAST row label and its "mA" unit (the page repeats the label as a
+# section heading above the table: " Stromeingang Eingang Wert Einheit Stromeingang 7,044 mA "). Not
+# every controller is set to German: PIT002 says " current input input reading dimension current input
+# 16,106 mA " (found 2026-09-24 as a false loop-unreadable), so both labels are accepted, and a page
+# with neither falls back to the workers' rule - the first "n,nnn mA" anywhere on it.
+_LABEL = r"(?:Stromeingang|current\s+input)"
+_CELL = re.compile(r"%s\s+((?:(?!%s).)*?)\s*mA\b" % (_LABEL, _LABEL), re.S | re.I)
+_ANY_MA = re.compile(r"([0-9]+[.,][0-9]+)\s*mA\b")
+_NUM = re.compile(r"^[0-9]+[.,][0-9]+$")                  # decimal comma on the VEGAMET 391, both languages
 _ERR = re.compile(r"\bE\s?0?(\d{2,3})\b")   # evidence key is `err`, never `code`: ctx.event(code, **fields) owns that name
 
 
@@ -75,13 +80,15 @@ class VegametLoopHealer(Healer):
 
     @staticmethod
     def _input_cell(text):
-        """The value cell of the 'Stromeingang' row: the text between the row label and the unit
-        'mA' ("7,044" or "E 015"); None if the page has no such row. The same page the workers
-        (v2) read for current_ma; they take the first 'n,nnn mA', this takes the labelled cell."""
+        """The value cell of the current-input row ('Stromeingang' / 'current input'): the text
+        between the row label and the unit 'mA' ("7,044" or "E 015"). A page in a third language
+        falls back to the workers' rule - the first 'n,nnn mA' anywhere on it (a number only; an
+        error code can only be read from a labelled row). None if there is neither."""
         m = _CELL.search(text)
-        if not m:
-            return None
-        return re.sub(r"\s+", " ", m.group(1)).strip()
+        if m:
+            return re.sub(r"\s+", " ", m.group(1)).strip()
+        m = _ANY_MA.search(text)
+        return m.group(1) if m else None
 
     # --- probes (instance methods -> stubbable) ---
     def _neigh(self, ctx, host):

@@ -1548,8 +1548,13 @@ def _wsh(acked, **kw):
     sh.restarts = []
     return sh
 
-def _wedge_ctx(acked_seq, **over):
-    """Feed successive ticks with the given bytes_acked values, spaced 65 s apart (fake clock)."""
+# a wedged socket has data stuck: the real PISN line (67 segments unacked, backoff 9, 227 KB queued).
+# v537: a flow with NOTHING unacked and an empty queue is an idle encoder, never a wedge.
+STUCK = {"unacked": 67, "backoff": 9, "sendq": 226885}
+
+def _wedge_ctx(acked_seq, sock=None, **over):
+    """Feed successive ticks with the given bytes_acked values, spaced 65 s apart (fake clock).
+    sock = the socket shape kwargs for _ss_1935 (default: idle - nothing unacked)."""
     import pat_fleet_healer.healers.stream_socket as _m
     ctx, rec = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/CCTVApp/STREAM-1"}, **over)
     ctx.cfg.wedge_window_s = 300
@@ -1561,7 +1566,7 @@ def _wedge_ctx(acked_seq, **over):
     shs = []
     try:
         for a in acked_seq:
-            sh = _wsh(a)
+            sh = _wsh(a, **(sock or {}))
             ctx._svc["sh"] = sh
             shs.append(sh)
             h.run(ctx)
@@ -1575,7 +1580,7 @@ ctx, rec, shs = _wedge_ctx([1_000_000 * i for i in range(1, 8)])
 check("W1 healthy socket -> no event, no restart", not rec["events"] and not any(s.restarts for s in shs))
 
 # W2 total black hole: bytes_acked frozen for > window -> one event + one restart of pat-smart-stream
-ctx, rec, shs = _wedge_ctx([500] * 7)
+ctx, rec, shs = _wedge_ctx([500] * 7, sock=STUCK)
 _ev = [c for c, f in rec["events"] if c == "stream.socket-wedged"]
 check("W2 frozen bytes_acked -> stream.socket-wedged", len(_ev) == 1)
 _all = [x for s in shs for x in s.restarts]
@@ -1584,17 +1589,17 @@ check("W2 -> rate quota used", "stream-socket" in rec["rate_hit"])
 check("W2 -> not a second restart inside the settle window", sum(len(s.restarts) for s in shs) == 1)
 
 # W3 trickle: +1388 B every tick (the 09-12/15/16 flavour) is BELOW the threshold -> wedge
-ctx, rec, shs = _wedge_ctx([1388 * i for i in range(1, 8)])
+ctx, rec, shs = _wedge_ctx([1388 * i for i in range(1, 8)], sock=STUCK)
 check("W3 trickle (1.4 KB/tick) -> counted as wedged", any(c == "stream.socket-wedged" for c, _ in rec["events"]))
 
 # W4 AMS unreachable -> not our problem (F17 / supervisor), no event
-ctx, rec, shs = _wedge_ctx([500] * 7, tcp_up=lambda *a, **k: False)
+ctx, rec, shs = _wedge_ctx([500] * 7, sock=STUCK, tcp_up=lambda *a, **k: False)
 check("W4 AMS down -> silent", not rec["events"] and not any(s.restarts for s in shs))
 
 # W5 unit inactive / in grace -> silent
-ctx, rec, shs = _wedge_ctx([500] * 7, svc_active=lambda s: False)
+ctx, rec, shs = _wedge_ctx([500] * 7, sock=STUCK, svc_active=lambda s: False)
 check("W5 unit inactive -> silent", not rec["events"])
-ctx, rec, shs = _wedge_ctx([500] * 7, svc_age=lambda s: 10)
+ctx, rec, shs = _wedge_ctx([500] * 7, sock=STUCK, svc_age=lambda s: 10)
 check("W5 unit in startup grace -> silent", not rec["events"])
 
 # W6 no socket at all -> silent (liveness / supervisor territory)
@@ -1603,7 +1608,7 @@ StreamSocketHealer().run(ctx)
 check("W6 no :1935 socket -> silent", not rec["events"])
 
 # W7 quota spent -> escalate, no restart
-ctx, rec, shs = _wedge_ctx([500] * 7, rate_ok=lambda n: False)
+ctx, rec, shs = _wedge_ctx([500] * 7, sock=STUCK, rate_ok=lambda n: False)
 check("W7 rate exceeded -> socket-wedge-persists", esc_has(rec, "socket-wedge-persists"))
 check("W7 rate exceeded -> no restart", not any(s.restarts for s in shs))
 
@@ -1616,7 +1621,7 @@ ctx.cfg.wedge_window_s = 300; ctx.cfg.wedge_min_bytes = 100000
 import pat_fleet_healer.healers.stream_socket as _m
 _t = [1_790_000_000.0]; _o = _m.time.time; _m.time.time = lambda: _t[0]
 try:
-    sh = _wsh(500); ctx._svc["sh"] = sh; h = StreamSocketHealer()
+    sh = _wsh(500, **STUCK); ctx._svc["sh"] = sh; h = StreamSocketHealer()
     for _ in range(7):
         h.run(ctx); _t[0] += 65
 finally:
@@ -1637,6 +1642,90 @@ _ctx, _ = mkctx(sh=lambda c, timeout=15: (0, "State Recv-Q Send-Q\n0 226885 192.
 _s = StreamSocketHealer()._socket(_ctx)
 check("W10 ss parse: acked/backoff/unacked/sendq/peer", _s and _s["acked"] == 11352306180 and _s["backoff"] == 9
       and _s["unacked"] == 67 and _s["sendq"] == 226885 and _s["peer"].endswith(":1935"))
+check("W10 ss parse: flow key local>peer", _s and _s["key"] == "192.168.225.51:42514>122.154.116.228:1935")
+
+# --- v537: the PIT043 false wedge (2026-09-24 13:20, acked_delta=-6445423813, backoff 0) and its kin ---
+# W11 reconnect inside the window: the flow changes (new local port), the counter restarts small.
+# v536 compared 6.4 GB on the old flow with 1 MB on the new one and restarted a healthy unit.
+def _ss_flow(acked, port, **kw):
+    def sh(c, timeout=15):
+        if "dport = :1935" in c:
+            return (0, "Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                       "0 %d 192.168.1.128:%d 122.154.116.228:1935\n"
+                       "\t cubic rto:284 backoff:%d bytes_sent:1 bytes_acked:%d unacked:%d lastack:%d"
+                       % (kw.get("sendq", 30616), port, kw.get("backoff", 0), acked, kw.get("unacked", 23), kw.get("lastack", 20)), "")
+        if "systemctl restart" in c:
+            sh.restarts.append(c); return (0, "", "")
+        return (0, "", "")
+    sh.restarts = []
+    return sh
+
+def _flow_ctx(seq, **over):
+    """seq = [(bytes_acked, local_port), ...] one per tick, 65 s apart."""
+    import pat_fleet_healer.healers.stream_socket as _m
+    ctx, rec = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/CCTVApp/STREAM-1"}, **over)
+    ctx.cfg.wedge_window_s = 300; ctx.cfg.wedge_min_bytes = 100000
+    t0 = [1_790_000_000.0]; _o = _m.time.time; _m.time.time = lambda: t0[0]
+    h = StreamSocketHealer(); shs = []
+    try:
+        for a, p in seq:
+            sh = _ss_flow(a, p); ctx._svc["sh"] = sh; shs.append(sh); h.run(ctx); t0[0] += 65
+    finally:
+        _m.time.time = _o
+    return ctx, rec, shs
+
+_seq = [(6_445_000_000 + 1_000_000 * i, 48100) for i in range(4)] + [(1_000_000 * i, 48188) for i in range(1, 5)]
+ctx, rec, shs = _flow_ctx(_seq)
+check("W11 reconnect mid-window (new flow, small counter) -> NOT a wedge, no restart",
+      not rec["events"] and not any(s.restarts for s in shs))
+check("W11 samples restart on the new flow (keyed)", all(len(s) == 3 for s in rec["saved"]["samples"]) and
+      all(s[2].startswith("192.168.1.128:48188>") for s in rec["saved"]["samples"]))
+
+# W12 same flow, counter goes backwards (kernel/ss anomaly), then grows healthily from the new
+# baseline -> never a wedge (v536 saw 4 MB - 9.5 MB < 0 -> "stall")
+ctx, rec, shs = _flow_ctx([(9_000_000, 48100), (9_500_000, 48100), (100, 48100), (1_000_100, 48100), (2_000_100, 48100), (3_000_100, 48100), (4_000_100, 48100)])
+check("W12 backwards counter on the same flow -> baseline restarts, no event, no restart", not rec["events"] and not any(s.restarts for s in shs))
+
+# W13 idle encoder: frozen counter but nothing unacked and an empty queue -> not a wedge (camera healers' job)
+ctx, rec, shs = _wedge_ctx([500] * 7)                       # _ss_1935 defaults: unacked 0, sendq 0
+check("W13 idle socket (unacked 0, sendq 0) -> silent, no restart", not rec["events"] and not any(s.restarts for s in shs))
+
+# W14 two flows: a lingering black-holed one (huge counter, lastack 8 min ago, backoff 9) and the
+# live reconnect (small counter, acked 20 ms ago) -> the live one is judged -> healthy -> silent
+def _two_flows(live_acked):
+    def sh(c, timeout=15):
+        if "dport = :1935" in c:
+            return (0, "Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                       "0 226885 192.168.1.128:48100 122.154.116.228:1935\n"
+                       "\t cubic rto:120000 backoff:9 bytes_sent:1 bytes_acked:6445000000 unacked:67 lastack:480000\n"
+                       "0 30616 192.168.1.128:48188 122.154.116.228:1935\n"
+                       "\t cubic rto:284 backoff:0 bytes_sent:1 bytes_acked:%d unacked:23 lastack:20" % live_acked, "")
+        if "systemctl restart" in c:
+            sh.restarts.append(c); return (0, "", "")
+        return (0, "", "")
+    sh.restarts = []
+    return sh
+_c, _ = mkctx(sh=_two_flows(5_000_000))
+_pick = StreamSocketHealer()._socket(_c)
+check("W14 two flows -> the live one (smallest lastack) is picked", _pick and _pick["key"].startswith("192.168.1.128:48188>") and _pick["acked"] == 5_000_000)
+import pat_fleet_healer.healers.stream_socket as _m14
+_c, _r = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/x"}); _c.cfg.wedge_window_s = 300; _c.cfg.wedge_min_bytes = 100000
+_t = [1_790_000_000.0]; _o14 = _m14.time.time; _m14.time.time = lambda: _t[0]
+_shs = []
+try:
+    _h = StreamSocketHealer()
+    for i in range(1, 8):
+        _sh = _two_flows(1_000_000 * i); _c._svc["sh"] = _sh; _shs.append(_sh); _h.run(_c); _t[0] += 65
+finally:
+    _m14.time.time = _o14
+check("W14 lingering corpse beside a healthy flow -> silent, no restart", not _r["events"] and not any(s.restarts for s in _shs))
+
+# W15 the PISN black hole under the new rules still fires: one flow, frozen, data stuck, backoff climbing
+ctx, rec, shs = _flow_ctx([(500, 48100)] * 7)
+check("W15 same flow frozen with data unacked -> stream.socket-wedged + restart",
+      any(c == "stream.socket-wedged" for c, _ in rec["events"]) and sum(len(s.restarts) for s in shs) == 1)
+_f = [f for c, f in rec["events"] if c == "stream.socket-wedged"][0]
+check("W15 event carries acked_delta 0 and lastack_ms", _f.get("acked_delta") == 0 and "lastack_ms" in _f)
 
 # --- E2 MQTT channel ---
 def _mqctx(sockets, ticks_state=0, **over):
@@ -1739,8 +1828,21 @@ check("L11 the real PIT003 page text parses to the loop current, not the date or
 h, ctx, rec = _loopctx("<html>" + _PIT003 + "</html>")
 h.run(ctx)
 check("L11 -> in band, quiet, verdict ok", not rec["events"] and rec["saved"]["verdict"] == "ok")
-check("L12 no Stromeingang row at all -> unreadable cell is None",
-      VegametLoopHealer._input_cell(" Eingänge HART Sensoren 0.000 mA ") is None)
+check("L12 no current-input row and no 'n,nnn mA' anywhere (the real HART row has no unit) -> cell is None",
+      VegametLoopHealer._input_cell(" Eingänge HART Sensoren HART-Sensor 0 - 0.000 - ") is None)
+
+# --- v537: the controllers are not all German. PIT002 (2026-09-24) was a false radar.loop-unreadable.
+_PIT002 = (" Inputs Inputs from: 24/09/26 07:46:01 reload page current input input reading dimension "
+           "current input 16,106 mA HART input sensor address serialno. reading dimension digital input ")
+check("L13 the real PIT002 page (English) parses to the loop current", VegametLoopHealer._input_cell(_PIT002) == "16,106")
+h, ctx, rec = _loopctx("<html>" + _PIT002 + "</html>")
+h.run(ctx)
+check("L13 -> in band, quiet, verdict ok (no false loop-unreadable)", not rec["events"] and rec["saved"]["verdict"] == "ok")
+h, ctx, rec = _loopctx("<html><td>current input</td><td>E 015</td><td>mA</td></html>")
+h.run(ctx)
+check("L14 English page with E 015 -> radar.loop-open err=E015", any(c == "radar.loop-open" and f.get("err") == "E015" for c, f in rec["events"]))
+check("L15 a third language falls back to the workers' rule (first 'n,nnn mA')",
+      VegametLoopHealer._input_cell(" Entrées entrée courant 7,044 mA HART ") == "7,044")
 
 # --- E4 boot + dropler ---
 h = NodeBootHealer(); h._boot_id = staticmethod(lambda: "abc-123"); h._uptime = staticmethod(lambda: 42.0)

@@ -12,7 +12,14 @@ socket's own byte counter: a healthy encoder acks megabytes a minute, a wedge ac
 nothing. So: bytes_acked over the last WEDGE_WINDOW_S below WEDGE_MIN_BYTES while the unit is
 active and AMS answers on :1935 -> restart the stream unit once (rate-limited; a wedged ffmpeg
 ignores SIGTERM for ~90 s, so the restart is given time).
-Stations (pat-smart-stream) and signs (pat-sig-stream) alike; identity not required."""
+Stations (pat-smart-stream) and signs (pat-sig-stream) alike; identity not required.
+
+v537 (2026-09-24, five false restarts in the first hour of v536, PIT043 first): the counter is only
+meaningful WITHIN ONE FLOW. Samples carry the flow identity (local:port>peer:port); a reconnect
+starts a new baseline; a counter that goes backwards starts over; when several :1935 flows coexist
+(the old black-holed one lingers after ffmpeg reconnects) the LIVE one - most recently acked - is
+judged, so a corpse never speaks for a healthy stream; and a flow with nothing unacked and an empty
+send queue is an idle encoder (camera/encoder healers' territory), not a wedged socket."""
 import re
 import time
 from .base import Healer
@@ -38,8 +45,12 @@ class StreamSocketHealer(Healer):
         if sock is None:
             return self._reset(ctx, st, "no-socket")         # nothing pushing: the supervisor / liveness handle it
         now = time.time()
-        samples = [s for s in st.get("samples", []) if now - s[0] <= ctx.cfg.wedge_window_s + 90]
-        samples.append([now, sock["acked"]])
+        # only keyed samples (v537+) from the same flow count; a reconnect or a backwards counter
+        # is a new baseline, never a comparison across sockets
+        samples = [s for s in st.get("samples", []) if len(s) > 2 and now - s[0] <= ctx.cfg.wedge_window_s + 90]
+        if samples and (samples[-1][2] != sock["key"] or samples[-1][1] > sock["acked"]):
+            samples = []
+        samples.append([now, sock["acked"], sock["key"]])
         st["samples"] = samples[-8:]
         # a restart we just did: give the new socket a clean window before judging again
         if now - st.get("restart_ts", 0) < ctx.cfg.wedge_window_s:
@@ -50,8 +61,10 @@ class StreamSocketHealer(Healer):
         delta = samples[-1][1] - samples[0][1]
         if delta >= ctx.cfg.wedge_min_bytes:
             return ctx.state_save(_S, st)                    # data is flowing
+        if sock["unacked"] == 0 and sock["sendq"] == 0:
+            return ctx.state_save(_S, st)                    # nothing waiting to go out: idle encoder, not a wedged socket
         ev = {"svc": svc, "stall_s": int(span), "acked_delta": int(delta), "backoff": sock["backoff"],
-              "unacked": sock["unacked"], "sendq": sock["sendq"], "peer": sock["peer"]}
+              "unacked": sock["unacked"], "sendq": sock["sendq"], "lastack_ms": sock["lastack"], "peer": sock["peer"]}
         if not ctx.rate_ok(self.name):
             st["samples"] = []
             ctx.state_save(_S, st)
@@ -88,26 +101,31 @@ class StreamSocketHealer(Healer):
         return None
 
     def _socket(self, ctx):
-        """The established :1935 flow (largest bytes_acked if several), or None."""
+        """The LIVE established :1935 flow, or None. Each flow is keyed local:port>peer:port. If
+        several coexist (a reconnect leaves the old black-holed flow lingering until the kernel
+        gives up), the most recently acknowledged one (smallest lastack) is the live one; with no
+        lastack in the output (old ss), the largest bytes_acked wins as before."""
         rc, out, _ = ctx.sh("ss -tin state established '( dport = :1935 )' 2>/dev/null", timeout=10)
         if rc != 0 or not out:
             return None
-        best = None
-        peer, sendq = "", 0
+        flows = []
+        local, peer, sendq = "", "", 0
         for ln in out.splitlines():
-            m = re.match(r"\s*(\d+)\s+(\d+)\s+\S+\s+(\S+)", ln)
+            m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)", ln)
             if m and "bytes_acked" not in ln:
-                sendq, peer = int(m.group(2)), m.group(3)
+                sendq, local, peer = int(m.group(2)), m.group(3), m.group(4)
                 continue
             m = re.search(r"bytes_acked:(\d+)", ln)
             if not m:
                 continue
-            cand = {"acked": int(m.group(1)), "peer": peer, "sendq": sendq,
-                    "backoff": int((re.search(r"backoff:(\d+)", ln) or [None, 0])[1] or 0),
-                    "unacked": int((re.search(r"unacked:(\d+)", ln) or [None, 0])[1] or 0)}
-            if best is None or cand["acked"] > best["acked"]:
-                best = cand
-        return best
+            def field(k, _ln=ln):
+                f = re.search(r"\b%s:(\d+)" % k, _ln)
+                return int(f.group(1)) if f else 0
+            flows.append({"acked": int(m.group(1)), "key": "%s>%s" % (local, peer), "peer": peer, "sendq": sendq,
+                          "backoff": field("backoff"), "unacked": field("unacked"), "lastack": field("lastack")})
+        if not flows:
+            return None
+        return min(flows, key=lambda f: (f["lastack"], -f["acked"]))
 
     def _reset(self, ctx, st, why):
         if st.get("samples"):
