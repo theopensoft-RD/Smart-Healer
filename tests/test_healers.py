@@ -1828,8 +1828,21 @@ check("L11 the real PIT003 page text parses to the loop current, not the date or
 h, ctx, rec = _loopctx("<html>" + _PIT003 + "</html>")
 h.run(ctx)
 check("L11 -> in band, quiet, verdict ok", not rec["events"] and rec["saved"]["verdict"] == "ok")
-check("L12 no Stromeingang row at all -> unreadable cell is None",
-      VegametLoopHealer._input_cell(" Eingänge HART Sensoren 0.000 mA ") is None)
+check("L12 no current-input row and no 'n,nnn mA' anywhere (the real HART row has no unit) -> cell is None",
+      VegametLoopHealer._input_cell(" Eingänge HART Sensoren HART-Sensor 0 - 0.000 - ") is None)
+
+# --- v537: the controllers are not all German. PIT002 (2026-09-24) was a false radar.loop-unreadable.
+_PIT002 = (" Inputs Inputs from: 24/09/26 07:46:01 reload page current input input reading dimension "
+           "current input 16,106 mA HART input sensor address serialno. reading dimension digital input ")
+check("L13 the real PIT002 page (English) parses to the loop current", VegametLoopHealer._input_cell(_PIT002) == "16,106")
+h, ctx, rec = _loopctx("<html>" + _PIT002 + "</html>")
+h.run(ctx)
+check("L13 -> in band, quiet, verdict ok (no false loop-unreadable)", not rec["events"] and rec["saved"]["verdict"] == "ok")
+h, ctx, rec = _loopctx("<html><td>current input</td><td>E 015</td><td>mA</td></html>")
+h.run(ctx)
+check("L14 English page with E 015 -> radar.loop-open err=E015", any(c == "radar.loop-open" and f.get("err") == "E015" for c, f in rec["events"]))
+check("L15 a third language falls back to the workers' rule (first 'n,nnn mA')",
+      VegametLoopHealer._input_cell(" Entrées entrée courant 7,044 mA HART ") == "7,044")
 
 # --- E4 boot + dropler ---
 h = NodeBootHealer(); h._boot_id = staticmethod(lambda: "abc-123"); h._uptime = staticmethod(lambda: 42.0)
