@@ -103,6 +103,47 @@ CODES = {
     "stream.camera-ambiguous": {"sev": "warn", "desc": "multiple cameras on LAN :554",
                       "cause": "more than one RTSP device", "fix": "human pick correct cam IP from d.found"},
 
+    # --- E1 stream socket wedge (v536) ---
+    "stream.socket-wedged":  {"sev": "warn", "desc": "RTMP push socket wedged: unit active, AMS reachable, but bytes_acked moved < d.acked_delta B in d.stall_s s (backoff d.backoff, unacked d.unacked) -> the stream unit was restarted",
+                      "cause": "after a 4G blip the carrier NAT dropped the TCP mapping; ffmpeg 4.3.9 has no write timeout and sits in poll() forever (the trickle flavour can last hours)",
+                      "fix": "none - restarted automatically; if it repeats hourly the uplink is flapping (see connectivity events)"},
+    "stream-socket.socket-wedge-persists": {"sev": "error", "desc": "socket wedge seen again with the restart quota spent (d.svc)",
+                      "cause": "the uplink keeps dropping the mapping, or the restart is not clearing it", "fix": "check usb0/EC25 signal and the carrier path; restart the unit by hand once and watch bytes_acked"},
+    "stream-socket.socket-restart-failed": {"sev": "error", "desc": "restart of d.svc after a socket wedge failed (rc d.rc)",
+                      "cause": "sudoers/unit, or a process that would not die within 150 s", "fix": "systemctl status d.svc; kill the ffmpeg by hand"},
+
+    # --- E2 MQTT channel dead (v536) ---
+    "mqtt.channel-dead":     {"sev": "warn", "desc": "no ESTABLISHED socket to the broker for d.ticks ticks while d.svc was active and the WAN was up -> d.svc restarted",
+                      "cause": "the client lost its connection and its reconnect loop stalled (PISN004 sat like this for 6 days: alerts never reached the sign)",
+                      "fix": "none - restarted automatically; if it recurs check the broker ACL/credentials for this node"},
+    "mqtt-channel.channel-restart-rate-exceeded": {"sev": "error", "desc": "MQTT channel dead again with the restart quota spent (d.svc)",
+                      "cause": "the client cannot hold a session: broker refuses it, TLS/credential mismatch, or a broken client build", "fix": "journalctl -u d.svc; test a manual connection from the node"},
+    "mqtt-channel.channel-restart-failed": {"sev": "error", "desc": "restart of d.svc for a dead MQTT channel failed",
+                      "cause": "sudoers/unit", "fix": "manual restart; check NOPASSWD sudoers"},
+
+    # --- E3 VEGAMET / 4-20 mA loop (v536, REPORT ONLY - nothing to restart) ---
+    "radar.vegamet-off-network": {"sev": "error", "desc": "the VEGAMET at d.host is not on the LAN (ARP d.arp, :502 closed)",
+                      "cause": "controller unpowered, cable/switch port, or it was re-IP'd (PIT001 2026-09-10)", "fix": "on-site: controller power + LAN; if re-IP'd set HOST"},
+    "radar.loop-open":       {"sev": "error", "desc": "4-20 mA loop open: the controller reports d.err / d.ma mA (< 3.6 mA = line break) - the level shown is NOT a measurement",
+                      "cause": "sensor cable/terminals open, or the VEGAPULS lost power or failed (PIT043 2026-09-17: 3.76 m -> 0.00 in four minutes, held for a week)",
+                      "fix": "on-site: loop wires at the VEGAMET input and the sensor connector, then the sensor; the controller display shows the same code until fixed"},
+    "radar.loop-over":       {"sev": "warn", "desc": "loop current d.ma mA above 20.5 mA (over-range or short)",
+                      "cause": "sensor over-range / wiring short / wrong scaling", "fix": "on-site: check wiring and the sensor's range setting"},
+    "radar.loop-unreadable": {"sev": "warn", "desc": "the controller's status page has no readable current value",
+                      "cause": "page layout differs or the page is failing", "fix": "open http://<host>/ from the Pi and compare with the expected 'Stromeingang ... mA' row"},
+    "radar.vegamet-error":   {"sev": "warn", "desc": "the controller shows error d.err on its current input",
+                      "cause": "see the VEGAMET 391 manual for the code", "fix": "on-site check; note the code"},
+    "radar.loop-ok":         {"sev": "info", "desc": "the loop is back in band (d.ma mA) after a reported fault",
+                      "cause": "repaired / reconnected", "fix": "none"},
+
+    # --- E4 node boot + fitted hardware (v536) ---
+    "node.boot":             {"sev": "warn", "desc": "the node has (re)booted: first tick of boot d.boot_id, uptime d.uptime_s s (previous boot d.prev)",
+                      "cause": "power loss, watchdog or a deliberate reboot", "fix": "none; the statistics service turns the heartbeat gap before this into an outage with this cause"},
+    "dropler.not-fitted":    {"sev": "info", "desc": "MODE=FULL but no RS485/USB serial adapter present (d.port) - the flow sensor is not fitted, not faulted",
+                      "cause": "site was configured FULL without the Doppler hardware", "fix": "set MODE=RADAR, or fit the adapter; do not count this as downtime"},
+    "dropler.fitted":        {"sev": "info", "desc": "a serial adapter appeared (d.devices) after a not-fitted report",
+                      "cause": "hardware fitted / re-plugged", "fix": "none"},
+
     # --- stream re-publish (F17) ---
     "stream-republish.republish-rate-exceeded":       {"sev": "warn",  "desc": "F17 re-publish rate exceeded",
                       "cause": "AMS flapping or stream repeatedly wedged", "fix": "check AMS ingest health; if AMS ok, check node stream"},
