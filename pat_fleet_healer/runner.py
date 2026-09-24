@@ -32,12 +32,36 @@ def run(cfg=None, ctx=None, registry=None):
             ctx.event("agent.exc", healer=getattr(h, "name", "?"), err=repr(e))  # isolation: one fault must not stop the engine
     # carry the BUILD id, not just the version: two artifacts can claim the same
     # number (dist/ shipped v529 while source said 531 on 2026-09-22).
-    ctx.heartbeat(sw=__version__, build=buildinfo.describe(__version__), healers=ran)
+    # Since v536 the heartbeat also names the WORKER set this station runs (and its
+    # proven fallback), so the fleet answers "who is behind?" from the event stream.
+    ctx.heartbeat(sw=__version__, build=buildinfo.describe(__version__), healers=ran,
+                  **_workers_identity(cfg))
     _clear_update_pending(ctx)              # rate-limited proof-of-life (NOT a per-tick log)
 
 
 def main():
     run()
+
+
+def _workers_identity(cfg):
+    """{workers, workers_build, workers_good} from the worker OTA's identity files; {} on a
+    node that has none (signs, or a station the updater has not armed yet). Never raises."""
+    import os
+    out = {}
+    try:
+        w = cfg.workers_dir
+        for key, path in (("workers", os.path.join(w, "WORKERS_VERSION")),
+                          ("workers_build", os.path.join(w, "BUILD")),
+                          ("workers_good", os.path.join(w, ".good", "WORKERS_VERSION"))):
+            try:
+                v = open(path).read().strip()
+            except Exception:
+                continue
+            if v:
+                out[key] = v[:40]
+    except Exception:
+        pass
+    return out
 
 
 def _clear_update_pending(ctx):

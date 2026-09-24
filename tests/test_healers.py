@@ -525,17 +525,22 @@ check("T-runner with DEVICE_ID -> all healers run",
 check("T-runner with DEVICE_ID -> no infra-only marker",
       not any(c == "agent.infra-only" for c, _ in rec["events"]))
 
-# T-registry: exactly the 3 infra healers survive on an identity-less node
+# T-registry: exactly these healers survive on an identity-less node (a sign): the four infra ones
+# plus, since v536, the boot marker and the two stream/MQTT channel healers that pick the sign's units
 _infra = sorted(h.name for h in default_registry() if not getattr(h, "requires_identity", True))
-check("T-registry infra set = beszel/connectivity/disk-hygiene/net-probe",
-      _infra == ["beszel", "connectivity", "disk-hygiene", "net-probe"])
+check("T-registry infra set = beszel/boot/connectivity/disk-hygiene/mqtt-channel/net-probe/stream-socket",
+      _infra == ["beszel", "boot", "connectivity", "disk-hygiene", "mqtt-channel", "net-probe", "stream-socket"])
 
-# T-registry: 8 healers, dependency-first order, unique names, F17 after stream-camera
+# T-registry: 14 healers, boot marker first then dependency, unique names, F17 after stream-camera
 reg = default_registry()
 names = [h.name for h in reg]
-check("T-registry has 9 healers", len(reg) == 9)
+check("T-registry has 14 healers", len(reg) == 14)
 check("T-registry names unique", len(set(names)) == len(names))
-check("T-registry dependency first", names[0] == "dependency")
+check("T-registry boot marker first, dependency next", names[:2] == ["boot", "dependency"])
+check("T-registry loop verdict after the radar repair, dropler after loop",
+      names.index("loop") == names.index("radar") + 1 and names.index("dropler") == names.index("loop") + 1)
+check("T-registry socket healer after camera/republish repairs", names.index("stream-socket") > names.index("stream-republish"))
+check("T-registry net-probe last", names[-1] == "net-probe")
 check("T-registry F17 after stream-camera", names.index("stream-republish") == names.index("stream") + 1)
 
 # ===========================================================================
@@ -1516,6 +1521,280 @@ try:
 finally:
     _events.mqtt.publish = _orig_pub
     _escalate.mqtt.publish = _orig_pub
+
+# ===========================================================================
+# v536 - E1 stream socket wedge, E2 MQTT channel, E3 VEGAMET loop, E4 boot / dropler
+# ===========================================================================
+from pat_fleet_healer.healers.stream_socket import StreamSocketHealer
+from pat_fleet_healer.healers.mqtt_channel import MqttChannelHealer
+from pat_fleet_healer.healers.vegamet_loop import VegametLoopHealer
+from pat_fleet_healer.healers.node_boot import NodeBootHealer
+from pat_fleet_healer.healers.dropler_fitted import DroplerFittedHealer
+
+def _ss_1935(acked, backoff=0, unacked=0, sendq=0):
+    return (0, "Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+               "0 %d 192.168.225.51:54222 122.154.116.228:1935\n"
+               "\t cubic rto:120000 backoff:%d bytes_sent:11358899878 bytes_acked:%d unacked:%d"
+               % (sendq, backoff, acked, unacked), "")
+
+def _wsh(acked, **kw):
+    def sh(c, timeout=15):
+        if "dport = :1935" in c:
+            return _ss_1935(acked, **kw)
+        if "systemctl restart" in c:
+            sh.restarts.append(c)
+            return (0, "", "")
+        return (0, "", "")
+    sh.restarts = []
+    return sh
+
+def _wedge_ctx(acked_seq, **over):
+    """Feed successive ticks with the given bytes_acked values, spaced 65 s apart (fake clock)."""
+    import pat_fleet_healer.healers.stream_socket as _m
+    ctx, rec = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/CCTVApp/STREAM-1"}, **over)
+    ctx.cfg.wedge_window_s = 300
+    ctx.cfg.wedge_min_bytes = 100000
+    t0 = [1_790_000_000.0]
+    _orig = _m.time.time
+    _m.time.time = lambda: t0[0]
+    h = StreamSocketHealer()
+    shs = []
+    try:
+        for a in acked_seq:
+            sh = _wsh(a)
+            ctx._svc["sh"] = sh
+            shs.append(sh)
+            h.run(ctx)
+            t0[0] += 65
+    finally:
+        _m.time.time = _orig
+    return ctx, rec, shs
+
+# W1 healthy stream: bytes_acked grows by megabytes -> nothing happens
+ctx, rec, shs = _wedge_ctx([1_000_000 * i for i in range(1, 8)])
+check("W1 healthy socket -> no event, no restart", not rec["events"] and not any(s.restarts for s in shs))
+
+# W2 total black hole: bytes_acked frozen for > window -> one event + one restart of pat-smart-stream
+ctx, rec, shs = _wedge_ctx([500] * 7)
+_ev = [c for c, f in rec["events"] if c == "stream.socket-wedged"]
+check("W2 frozen bytes_acked -> stream.socket-wedged", len(_ev) == 1)
+_all = [x for s in shs for x in s.restarts]
+check("W2 -> restart pat-smart-stream (long timeout path)", len(_all) == 1 and "pat-smart-stream" in _all[0])
+check("W2 -> rate quota used", "stream-socket" in rec["rate_hit"])
+check("W2 -> not a second restart inside the settle window", sum(len(s.restarts) for s in shs) == 1)
+
+# W3 trickle: +1388 B every tick (the 09-12/15/16 flavour) is BELOW the threshold -> wedge
+ctx, rec, shs = _wedge_ctx([1388 * i for i in range(1, 8)])
+check("W3 trickle (1.4 KB/tick) -> counted as wedged", any(c == "stream.socket-wedged" for c, _ in rec["events"]))
+
+# W4 AMS unreachable -> not our problem (F17 / supervisor), no event
+ctx, rec, shs = _wedge_ctx([500] * 7, tcp_up=lambda *a, **k: False)
+check("W4 AMS down -> silent", not rec["events"] and not any(s.restarts for s in shs))
+
+# W5 unit inactive / in grace -> silent
+ctx, rec, shs = _wedge_ctx([500] * 7, svc_active=lambda s: False)
+check("W5 unit inactive -> silent", not rec["events"])
+ctx, rec, shs = _wedge_ctx([500] * 7, svc_age=lambda s: 10)
+check("W5 unit in startup grace -> silent", not rec["events"])
+
+# W6 no socket at all -> silent (liveness / supervisor territory)
+ctx, rec = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/x"}, sh=lambda c, timeout=15: (0, "", ""))
+StreamSocketHealer().run(ctx)
+check("W6 no :1935 socket -> silent", not rec["events"])
+
+# W7 quota spent -> escalate, no restart
+ctx, rec, shs = _wedge_ctx([500] * 7, rate_ok=lambda n: False)
+check("W7 rate exceeded -> socket-wedge-persists", esc_has(rec, "socket-wedge-persists"))
+check("W7 rate exceeded -> no restart", not any(s.restarts for s in shs))
+
+# W8 dry run -> event + log, no restart
+ctx, rec, shs = _wedge_ctx([500] * 7)
+ctx2, rec2, shs2 = (None, None, None)
+ctx, rec = mkctx(env={"RTMP_URL": "rtmp://rtmp.example/x"})
+ctx.cfg.dry_run = True
+ctx.cfg.wedge_window_s = 300; ctx.cfg.wedge_min_bytes = 100000
+import pat_fleet_healer.healers.stream_socket as _m
+_t = [1_790_000_000.0]; _o = _m.time.time; _m.time.time = lambda: _t[0]
+try:
+    sh = _wsh(500); ctx._svc["sh"] = sh; h = StreamSocketHealer()
+    for _ in range(7):
+        h.run(ctx); _t[0] += 65
+finally:
+    _m.time.time = _o
+check("W8 dry run -> event but NO restart", any(c == "stream.socket-wedged" for c, _ in rec["events"]) and not sh.restarts
+      and any("would restart" in m for m in rec["log"]))
+
+# W9 sign (no DEVICE_ID) -> pat-sig-stream is the unit
+ctx, rec = mkctx(unit_exists=lambda s: s == "pat-sig-stream")
+ctx.cfg.device_id = ""
+check("W9 sign -> unit pat-sig-stream", StreamSocketHealer()._unit(ctx) == "pat-sig-stream")
+ctx, rec = mkctx(unit_exists=lambda s: False)
+ctx.cfg.device_id = ""
+check("W9 node with neither unit -> no target", StreamSocketHealer()._unit(ctx) is None)
+
+# W10 ss parsing: the real sign line
+_ctx, _ = mkctx(sh=lambda c, timeout=15: (0, "State Recv-Q Send-Q\n0 226885 192.168.225.51:42514 122.154.116.228:1935\n\t cubic rto:120000 backoff:9 bytes_sent:11358898490 bytes_acked:11352306180 unacked:67", ""))
+_s = StreamSocketHealer()._socket(_ctx)
+check("W10 ss parse: acked/backoff/unacked/sendq/peer", _s and _s["acked"] == 11352306180 and _s["backoff"] == 9
+      and _s["unacked"] == 67 and _s["sendq"] == 226885 and _s["peer"].endswith(":1935"))
+
+# --- E2 MQTT channel ---
+def _mqctx(sockets, ticks_state=0, **over):
+    calls = {"n": 0}
+    def sh(c, timeout=15):
+        if "dport = :1883" in c:
+            return (0, "\n".join("0 0 10.0.0.2:5%d 10.0.4.80:1883" % i for i in range(sockets)), "")
+        return (0, "", "")
+    ctx, rec = mkctx(state={"dead_ticks": ticks_state}, sh=sh, **over)
+    ctx.cfg.mqtt_dead_ticks = 5
+    return ctx, rec
+
+ctx, rec = _mqctx(sockets=1)
+MqttChannelHealer().run(ctx)
+check("Q1 broker socket present -> silent", not rec["events"] and not rec["restart"])
+
+ctx, rec = _mqctx(sockets=0, ticks_state=3)
+MqttChannelHealer().run(ctx)
+check("Q2 no socket, 4th tick -> still counting, no restart", not rec["restart"] and rec["saved"]["dead_ticks"] == 4)
+
+ctx, rec = _mqctx(sockets=0, ticks_state=4)
+MqttChannelHealer().run(ctx)
+check("Q3 no socket for 5 ticks -> mqtt.channel-dead + restart radar", any(c == "mqtt.channel-dead" for c, _ in rec["events"])
+      and rec["restart"] == ["pat-smart-radar"] and rec["saved"]["dead_ticks"] == 0)
+
+ctx, rec = _mqctx(sockets=0, ticks_state=4, tcp_up=lambda *a, **k: False)
+MqttChannelHealer().run(ctx)
+check("Q4 WAN down -> the connectivity healer's problem, not ours", not rec["events"] and not rec["restart"])
+
+ctx, rec = _mqctx(sockets=0, ticks_state=4, rate_ok=lambda n: False)
+MqttChannelHealer().run(ctx)
+check("Q5 rate exceeded -> escalate, no restart", esc_has(rec, "channel-restart-rate-exceeded") and not rec["restart"])
+
+ctx, rec = _mqctx(sockets=0, ticks_state=4, unit_exists=lambda s: s == "pat-sig")
+ctx.cfg.device_id = ""
+MqttChannelHealer().run(ctx)
+check("Q6 sign -> restarts pat-sig", rec["restart"] == ["pat-sig"])
+
+ctx, rec = mkctx(state={"dead_ticks": 4}, sh=lambda c, timeout=15: (1, "", "no ss"))
+MqttChannelHealer().run(ctx)
+check("Q7 broken probe (ss failed) -> never acts", not rec["events"] and not rec["restart"])
+
+# --- E3 VEGAMET loop (report only) ---
+# the real page shape (PIT003 2026-09-24): the label is a section heading AND the row label
+_PAGE_OK = ("<html><h2>Stromeingang</h2><table><tr><th>Eingang</th><th>Wert</th><th>Einheit</th></tr>"
+            "<tr><td>Stromeingang</td><td>5,296</td><td>mA</td></tr></table>HART Sensoren</html>")
+_PAGE_E015 = "<html><td>Stromeingang</td><td>E 015</td><td>mA</td></html>"
+_PAGE_LOW = "<html><td>Stromeingang</td><td>3,100</td><td>mA</td></html>"
+_PAGE_HIGH = "<html><td>Stromeingang</td><td>21,7</td><td>mA</td></html>"
+
+def _loopctx(page, neigh="REACHABLE", tcp=True, state=None):
+    ctx, rec = mkctx(state=state or {}, tcp_up=lambda *a, **k: tcp)
+    h = VegametLoopHealer()
+    h._neigh = lambda ctx, host: neigh
+    h._page = lambda ctx, host: page
+    return h, ctx, rec
+
+h, ctx, rec = _loopctx(_PAGE_OK)
+h.run(ctx)
+check("L1 in-band current, first sight -> no event (ok is the quiet state)", not rec["events"] and rec["saved"]["verdict"] == "ok")
+
+h, ctx, rec = _loopctx(_PAGE_E015)
+h.run(ctx)
+check("L2 E 015 -> radar.loop-open with the code", any(c == "radar.loop-open" and f.get("err") == "E015" for c, f in rec["events"]))
+check("L2 -> no restart, no escalate (report only)", not rec["restart"] and not rec["escalate"])
+
+h, ctx, rec = _loopctx(_PAGE_E015, state={"verdict": "loop-open", "reported": True})
+h.run(ctx)
+check("L3 same verdict next tick -> silent (transition only)", not rec["events"])
+
+h, ctx, rec = _loopctx(_PAGE_OK, state={"verdict": "loop-open", "reported": True})
+h.run(ctx)
+check("L4 back in band -> radar.loop-ok", any(c == "radar.loop-ok" for c, _ in rec["events"]))
+
+h, ctx, rec = _loopctx(_PAGE_LOW)
+h.run(ctx)
+check("L5 3.1 mA -> loop-open", any(c == "radar.loop-open" and f.get("ma") == 3.1 for c, f in rec["events"]))
+h, ctx, rec = _loopctx(_PAGE_HIGH)
+h.run(ctx)
+check("L6 21.7 mA -> loop-over", any(c == "radar.loop-over" for c, _ in rec["events"]))
+
+h, ctx, rec = _loopctx(None, neigh="INCOMPLETE", tcp=False)
+h.run(ctx)
+check("L7 ARP INCOMPLETE + :502 closed -> vegamet-off-network", any(c == "radar.vegamet-off-network" for c, _ in rec["events"]))
+
+h, ctx, rec = _loopctx(None, neigh="REACHABLE")
+h.run(ctx)
+check("L8 page unreadable this tick -> say nothing", not rec["events"] and rec["saved"] is None)
+
+h, ctx, rec = _loopctx("<html><td>Stromeingang</td><td>E 042</td><td>mA</td></html>")
+h.run(ctx)
+check("L9 other E-code -> vegamet-error", any(c == "radar.vegamet-error" and f.get("err") == "E042" for c, f in rec["events"]))
+
+check("L10 the real PIT043 page text parses to E 015",
+      VegametLoopHealer._input_cell(" Eingänge Stromeingang Eingang Wert Einheit Stromeingang E 015 mA HART Sensoren ") == "E 015")
+_PIT003 = (" Eing&auml;nge Eing&auml;nge vom: 24.09.26 05:34:20 Seite aktualisieren Stromeingang Eingang Wert Einheit "
+           "Stromeingang 7,044 mA HART Sensoren Sensor Adresse Seriennr. Wert Einheit HART-Sensor 0 - 0.000 - ")
+check("L11 the real PIT003 page text parses to the loop current, not the date or the HART row",
+      VegametLoopHealer._input_cell(_PIT003) == "7,044")
+h, ctx, rec = _loopctx("<html>" + _PIT003 + "</html>")
+h.run(ctx)
+check("L11 -> in band, quiet, verdict ok", not rec["events"] and rec["saved"]["verdict"] == "ok")
+check("L12 no Stromeingang row at all -> unreadable cell is None",
+      VegametLoopHealer._input_cell(" Eingänge HART Sensoren 0.000 mA ") is None)
+
+# --- E4 boot + dropler ---
+h = NodeBootHealer(); h._boot_id = staticmethod(lambda: "abc-123"); h._uptime = staticmethod(lambda: 42.0)
+ctx, rec = mkctx()
+h.run(ctx)
+check("B1 first sight of a boot id -> node.boot with uptime", any(c == "node.boot" and f.get("uptime_s") == 42 for c, f in rec["events"]))
+ctx, rec = mkctx(state={"boot_id": "abc-123"})
+h.run(ctx)
+check("B2 same boot id -> silent", not rec["events"])
+ctx, rec = mkctx(state={"boot_id": "old-999"})
+h.run(ctx)
+check("B3 new boot id -> node.boot names the previous boot", any(c == "node.boot" and f.get("prev") == "old-999" for c, f in rec["events"]))
+
+d = DroplerFittedHealer()
+d._serial_devices = staticmethod(lambda: [])
+ctx, rec = mkctx(env={"MODE": "FULL"})
+d.run(ctx)
+check("D1 FULL without ttyUSB -> dropler.not-fitted once", [c for c, _ in rec["events"]] == ["dropler.not-fitted"])
+ctx, rec = mkctx(env={"MODE": "FULL"}, state={"missing": True, "boot": ""})
+d.run(ctx)
+check("D2 already reported this boot -> silent", not rec["events"])
+ctx, rec = mkctx(env={"MODE": "RADAR"})
+d.run(ctx)
+check("D3 RADAR node -> silent", not rec["events"])
+d._serial_devices = staticmethod(lambda: ["/dev/ttyUSB0"])
+ctx, rec = mkctx(env={"MODE": "FULL"}, state={"missing": True, "boot": ""})
+d.run(ctx)
+check("D4 adapter appears -> dropler.fitted", any(c == "dropler.fitted" for c, _ in rec["events"]))
+
+# --- heartbeat carries the worker identity ---
+_wd = tempfile.mkdtemp(); _TMP.append(_wd)
+os.makedirs(os.path.join(_wd, ".good"))
+open(os.path.join(_wd, "WORKERS_VERSION"), "w").write("2\n"); open(os.path.join(_wd, "BUILD"), "w").write("2+gce84269\n")
+open(os.path.join(_wd, ".good", "WORKERS_VERSION"), "w").write("2\n")
+ctx, rec = mkctx()
+ctx.cfg.workers_dir = _wd
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[])
+check("H-workers heartbeat carries workers/workers_build/workers_good",
+      rec["hb"] and rec["hb"][-1].get("workers") == "2" and rec["hb"][-1].get("workers_build") == "2+gce84269" and rec["hb"][-1].get("workers_good") == "2")
+ctx, rec = mkctx()
+ctx.cfg.workers_dir = tempfile.mkdtemp(); _TMP.append(ctx.cfg.workers_dir)
+runner.run(cfg=ctx.cfg, ctx=ctx, registry=[])
+check("H-workers no identity files -> fields absent, not empty", rec["hb"] and "workers" not in rec["hb"][-1])
+
+# --- manifest covers every new code ---
+_new = ["stream.socket-wedged", "stream-socket.socket-wedge-persists", "stream-socket.socket-restart-failed",
+        "mqtt.channel-dead", "mqtt-channel.channel-restart-rate-exceeded", "mqtt-channel.channel-restart-failed",
+        "radar.vegamet-off-network", "radar.loop-open", "radar.loop-over", "radar.loop-unreadable", "radar.vegamet-error",
+        "radar.loop-ok", "node.boot", "dropler.not-fitted", "dropler.fitted"]
+from pat_fleet_healer import events_schema as _SCH2
+check("E-manifest decodes every v536 code", all(c in _SCH2.CODES for c in _new))
+check("E-manifest: physical causes are report-only sev (error) with a field fix",
+      all("on-site" in _SCH2.CODES[c]["fix"] for c in ("radar.vegamet-off-network", "radar.loop-open")))
+
 
 # ---------------------------------------------------------------------------
 for d in _TMP:

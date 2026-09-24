@@ -91,6 +91,14 @@ class Config:
         self.probe_centre = (self.env.get("PROBE_CENTRE") or o.get("PROBE_CENTRE")
                              or "%s:%d" % (self.mqtt_host, self.mqtt_port))
 
+        # E1 stream socket wedge: bytes_acked must grow by at least WEDGE_MIN_BYTES over
+        # WEDGE_WINDOW_S while the unit is active and AMS answers, else the socket is wedged.
+        # A 2.5 Mbit/s encoder acks ~18 MB/min; the recorded trickle wedge acked ~5 KB/min.
+        self.wedge_window_s  = int(o.get("WEDGE_WINDOW_S", "300"))
+        self.wedge_min_bytes = int(o.get("WEDGE_MIN_BYTES", "100000"))
+        # E2 MQTT channel: consecutive ticks with no ESTABLISHED broker socket before restarting
+        self.mqtt_dead_ticks = int(o.get("MQTT_DEAD_TICKS", "5"))
+
         # uplink recovery (ec25/IRIV): EC25 has no external watchdog -> the healer resets the modem
         self.wan_down_confirm = int(o.get("WAN_DOWN_CONFIRM", "3"))   # consecutive WAN-down ticks before acting (verify-before-concluding)
         self.ec25_settle_s    = int(o.get("EC25_SETTLE_S", "45"))     # wait after modem reset before judging recovery (< ~60s tick)
