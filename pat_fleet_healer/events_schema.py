@@ -95,6 +95,8 @@ CODES = {
     # --- stream / camera (F4-F9) ---
     "stream.stream-repair-rate-exceeded": {"sev": "warn", "desc": "stream repair rate exceeded",
                       "cause": "stream won't stay up", "fix": "check camera reachability/codec + ffmpeg journal"},
+    "stream.camera-ok":      {"sev": "info", "desc": "the stream is pushing again; clears the earlier verdict d.was (camera verdicts are sent on change, at most hourly while they stand)",
+                      "cause": "camera back / repaired", "fix": "none"},
     "stream.camera-absent":  {"sev": "error", "desc": "stream down + no camera on LAN :554",
                       "cause": "camera unplugged / PoE water-ingress / LAN strain (physical)", "fix": "on-site: re-seat + waterproof PoE connector; strain-relief LAN"},
     "stream.camera-path-unknown": {"sev": "error", "desc": "camera on :554 but brand not recognised",
@@ -127,7 +129,7 @@ CODES = {
     "radar.loop-open":       {"sev": "error", "desc": "4-20 mA loop open: the controller reports d.err / d.ma mA (< 3.6 mA = line break) - the level shown is NOT a measurement",
                       "cause": "sensor cable/terminals open, or the VEGAPULS lost power or failed (PIT043 2026-09-17: 3.76 m -> 0.00 in four minutes, held for a week)",
                       "fix": "on-site: loop wires at the VEGAMET input and the sensor connector, then the sensor; the controller display shows the same code until fixed"},
-    "radar.loop-over":       {"sev": "warn", "desc": "loop current d.ma mA above 20.5 mA (over-range or short)",
+    "radar.loop-over":       {"sev": "warn", "desc": "loop current d.ma mA at or above 21.0 mA (NAMUR NE43 failure: short or sensor fault; 20.0-20.5 is only the sensor at full scale)",
                       "cause": "sensor over-range / wiring short / wrong scaling", "fix": "on-site: check wiring and the sensor's range setting"},
     "radar.loop-unreadable": {"sev": "warn", "desc": "the controller's status page has no readable current value",
                       "cause": "page layout differs or the page is failing", "fix": "open http://<host>/ from the Pi and compare with the expected 'Stromeingang ... mA' row"},

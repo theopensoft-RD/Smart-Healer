@@ -10,15 +10,17 @@ Two reads a tick, both cheap and read-only:
      -> E013/E014/E015    = radar.loop-open   (sensor current < 3.6 mA / line break: the VEGAPULS is
                             not on the loop - PIT043 read 0.00 m for a week this way, 2026-09-17..24)
      -> other E0xx        = radar.vegamet-error
-     -> < 3.8 mA / > 20.5 = radar.loop-open / radar.loop-over
+     -> <= 3.6 / >= 21.0 mA = radar.loop-open / radar.loop-over (NAMUR NE43 failure limits; 3.8-4.0 is
+                            the under-range of a DRY sensor and 20.0-20.5 its over-range - measurements,
+                            not faults: PIR010 at 3.799 mA was wrongly called loop-open on 2026-09-24)
      -> in band           = ok (radar.loop-ok on recovery so the record clears)
 The worker publishes the raw number; this is the field-facing verdict beside it."""
 import re
 from .base import Healer
 
 _S = "loop"
-LOOP_MIN_MA = 3.8
-LOOP_MAX_MA = 20.5
+LOOP_MIN_MA = 3.6      # NAMUR NE43: <= 3.6 mA = failure (open loop / sensor fault)
+LOOP_MAX_MA = 21.0     # NAMUR NE43: >= 21.0 mA = failure (short / sensor fault)
 # the cell is the text between the LAST row label and its "mA" unit (the page repeats the label as a
 # section heading above the table: " Stromeingang Eingang Wert Einheit Stromeingang 7,044 mA "). Not
 # every controller is set to German: PIT002 says " current input input reading dimension current input
@@ -72,9 +74,9 @@ class VegametLoopHealer(Healer):
         if not _NUM.match(cell):
             return "loop-unreadable", {"host": host, "cell": cell[:24]}
         ma = float(cell.replace(",", "."))
-        if ma < LOOP_MIN_MA:
+        if ma <= LOOP_MIN_MA:
             return "loop-open", {"host": host, "ma": ma}
-        if ma > LOOP_MAX_MA:
+        if ma >= LOOP_MAX_MA:
             return "loop-over", {"host": host, "ma": ma}
         return "ok", {"host": host, "ma": ma}
 

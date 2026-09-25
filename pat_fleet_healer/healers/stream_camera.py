@@ -14,6 +14,9 @@ import re
 import time
 from .base import Healer
 
+_VS = "stream-verdict"
+REMIND_S = 3600     # an outstanding verdict is re-sent at most hourly (keeps the record's lastSeen honest)
+
 # brand -> CANDIDATE main-stream RTSP paths, most-likely first. These are candidates,
 # never assumptions: each one is probed and the first that actually answers is kept.
 # Hikvision is listed /stream0-first because that is what this fleet is wired with and
@@ -34,10 +37,11 @@ class StreamCameraHealer(Healer):
         # not broken if it is actively pushing -> only enforce STATION_NAME quoting (idempotent)
         if ctx.svc_active(svc) and ctx.estab_1935() > 0:
             self._fix_station_name_quote(ctx)
+            self._clear(ctx)
             return
         name = self.name
         if not ctx.rate_ok(name):
-            return ctx.escalate(name, "stream-repair-rate-exceeded")
+            return self._say(ctx, "stream-repair-rate-exceeded")
         changed = self._fix_station_name_quote(ctx)
         cred = self._cam_cred(ctx)
         cur_ip = None
@@ -52,9 +56,9 @@ class StreamCameraHealer(Healer):
         if need_cam:
             found = self._scan_554(ctx)
             if len(found) == 0:
-                return ctx.escalate(name, "camera-absent", {"configured": cur_ip})
+                return self._say(ctx, "camera-absent", {"configured": cur_ip})
             if len(found) > 1:
-                return ctx.escalate(name, "camera-ambiguous", {"found": found})
+                return self._say(ctx, "camera-ambiguous", {"found": found})
             newip = found[0]
             ctx.log("camera %s -> %s (drift/placeholder) + H.264" % (cur_ip, newip))
             self._set_codec_h264(ctx, newip, cred)
@@ -68,8 +72,7 @@ class StreamCameraHealer(Healer):
             brand = self._detect_brand(ctx, cur_ip, cred)
             path = self._find_working_path(ctx, cur_ip, cred, brand)
             if not path:
-                return ctx.escalate(name, "camera-path-unknown",
-                                    {"ip": cur_ip, "brand": brand or "unknown"})
+                return self._say(ctx, "camera-path-unknown", {"ip": cur_ip, "brand": brand or "unknown"})
             ctx.log("camera %s is %s -> RTSP path %s" % (cur_ip, brand, path))
             self._set_codec_h264(ctx, cur_ip, cred)
             self._repoint_path(ctx, path)
@@ -77,6 +80,25 @@ class StreamCameraHealer(Healer):
         if changed or not ctx.svc_active(svc) or ctx.estab_1935() == 0:
             ctx.rate_hit(name)
             ctx.restart(svc)
+
+    # --- verdicts: on change, not every tick (v538) ---
+    # camera-absent was escalated on EVERY tick while a camera stayed dead: 489 lines an hour from
+    # nine known-offline cameras on 2026-09-24, and PIT019 alternated absent / path-unknown so the
+    # record logged a new "change" each minute. Now: the first time, when the verdict changes, and
+    # at most hourly while it stands; stream.camera-ok once when the stream pushes again.
+    def _say(self, ctx, verdict, ev=None):
+        st = ctx.state_load(_VS) or {}
+        now = time.time()
+        if st.get("v") == verdict and now - float(st.get("t", 0)) < REMIND_S:
+            return None
+        ctx.state_save(_VS, {"v": verdict, "t": now})
+        return ctx.escalate(self.name, verdict, ev or {})
+
+    def _clear(self, ctx):
+        st = ctx.state_load(_VS) or {}
+        if st.get("v"):
+            ctx.state_save(_VS, {})
+            ctx.event("stream.camera-ok", was=st["v"])
 
     # --- helpers (instance methods -> stubbable in tests) ---
     def _scan_554(self, ctx):

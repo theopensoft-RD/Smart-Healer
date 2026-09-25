@@ -1898,6 +1898,142 @@ check("E-manifest: physical causes are report-only sev (error) with a field fix"
       all("on-site" in _SCH2.CODES[c]["fix"] for c in ("radar.vegamet-off-network", "radar.loop-open")))
 
 
+# ===========================================================================
+# v538 (2026-09-25) - selftest never publishes, camera verdicts on change, NAMUR loop limits
+# Found by the 2026-09-25 validation of the status record: update selftests posted node.boot under
+# real ids and a phantom node "SELFTEST"; camera-absent went out every tick; PIR010 at 3.799 mA was
+# called loop-open.
+# ===========================================================================
+import socket as _socket
+import subprocess as _sp
+import threading as _th
+from pat_fleet_healer.core import mqtt as _mq
+
+# V1 the publisher switch: HEALER_NO_PUSH=1 -> False, and no socket is ever opened
+_calls = []
+_orig_cc = _mq.socket.create_connection
+_mq.socket.create_connection = lambda *a, **k: (_calls.append(a), (_ for _ in ()).throw(OSError("blocked")))[1]
+try:
+    os.environ["HEALER_NO_PUSH"] = "1"
+    _r = _mq.publish("127.0.0.1", 1, "fleet/events/X", "{}", "X")
+finally:
+    os.environ.pop("HEALER_NO_PUSH", None)
+    _mq.socket.create_connection = _orig_cc
+check("V1 HEALER_NO_PUSH=1 -> publish returns False", _r is False)
+check("V1 HEALER_NO_PUSH=1 -> no connection attempted at all", _calls == [])
+
+def _listener():
+    s = _socket.socket(); s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0)); s.listen(64)
+    hits = []                     # MQTT CONNECTs only: net_probe's centre probe is a bare TCP connect
+    def acc():                    # to the broker address every tick (a measurement, not a publish)
+        while True:
+            try:
+                c, _ = s.accept()
+            except OSError:
+                return
+            try:
+                c.settimeout(2.0)
+                if c.recv(1) == b"":        # MQTT 3.1.1 fixed header of CONNECT
+                    hits.append(1)
+            except OSError:
+                pass
+            finally:
+                c.close()
+    _th.Thread(target=acc, daemon=True).start()
+    return s, s.getsockname()[1], hits
+
+# V2 control: the listener does see a real publish attempt (so V3's zero means something)
+_srv, _port, _hits = _listener()
+_mq.publish("127.0.0.1", _port, "fleet/events/X", "{}", "X", timeout=2.0)
+time.sleep(0.3)
+check("V2 control: a normal publish reaches the test listener as an MQTT CONNECT", len(_hits) >= 1)
+_srv.close()
+
+# V3 end to end: `healer selftest` with a node .env pointing MQTT at the listener -> ZERO connections
+if os.name == "posix":
+    _srv, _port, _hits = _listener()
+    _envd = tempfile.mkdtemp(); _TMP.append(_envd)
+    _envf = os.path.join(_envd, ".env")
+    open(_envf, "w").write("DEVICE_ID=PAT-TEST-SELF\nMQTT_HOST=127.0.0.1\nMQTT_PORT=%d\nMODE=RADAR\n" % _port)
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _e = dict(os.environ, HEALER_ENV_PATH=_envf, MQTT_HOST="127.0.0.1", MQTT_PORT=str(_port))
+    _e.pop("HEALER_NO_PUSH", None)
+    try:
+        _p = _sp.run([sys.executable, "-m", "pat_fleet_healer", "selftest"], cwd=_root, env=_e,
+                     stdout=_sp.PIPE, stderr=_sp.STDOUT, universal_newlines=True, timeout=240)
+        _out, _rc = _p.stdout, _p.returncode
+    except _sp.TimeoutExpired:
+        _out, _rc = "TIMEOUT", -1
+    time.sleep(0.3)
+    check("V3 selftest still passes (exit 0, 'selftest OK')", _rc == 0 and "selftest OK" in _out)
+    check("V3 selftest sends ZERO MQTT CONNECTs to the configured broker", len(_hits) == 0)
+    _srv.close()
+    # V3c control: the SAME dry tick without the selftest switch does publish (= the pre-v538 selftest)
+    _srv, _port, _hits = _listener()
+    open(_envf, "w").write("DEVICE_ID=PAT-TEST-SELF\nMQTT_HOST=127.0.0.1\nMQTT_PORT=%d\nMODE=RADAR\n" % _port)
+    _e = dict(os.environ, HEALER_ENV_PATH=_envf, MQTT_HOST="127.0.0.1", MQTT_PORT=str(_port),
+              HEALER_DRY_RUN="1", HEALER_STATE_DIR=tempfile.mkdtemp())
+    _TMP.append(_e["HEALER_STATE_DIR"]); _e.pop("HEALER_NO_PUSH", None)
+    try:
+        _sp.run([sys.executable, "-c", "from pat_fleet_healer.runner import main; main()"], cwd=_root, env=_e,
+                stdout=_sp.PIPE, stderr=_sp.STDOUT, universal_newlines=True, timeout=240)
+    except _sp.TimeoutExpired:
+        pass
+    time.sleep(0.3)
+    check("V3c control: a plain dry tick DOES publish (so V3's zero is the fix, not a quiet tick)", len(_hits) >= 1)
+    _srv.close()
+else:
+    print("V3 skipped: POSIX only (run the suite on a node)")
+
+# V4 camera verdicts: once, not every tick; again when the verdict changes; hourly reminder; ok on recovery
+def _camctx(state=None, pushing=False):
+    return mkctx(state=state, env={"RTSP_URL": "rtsp://admin:x@192.168.1.99:554/s"},
+                 svc_active=lambda s: True, svc_age=lambda s: 999,
+                 estab_1935=(lambda: 1) if pushing else (lambda: 0), tcp_up=lambda *a, **k: False)
+ctx, rec = _camctx()
+h = StreamCameraHealer(); h._scan_554 = lambda ctx: []
+h.run(ctx); h.run(ctx); h.run(ctx)
+check("V4 camera-absent over 3 ticks -> escalated ONCE", [v for _, v in rec["escalate"]].count("camera-absent") == 1)
+check("V4 ... and still no restart", len(rec["restart"]) == 0)
+h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
+h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
+check("V4 a DIFFERENT verdict goes out at once, then is quiet too",
+      [v for _, v in rec["escalate"]] == ["camera-absent", "camera-path-unknown"])
+ctx, rec = _camctx(state={"v": "camera-absent", "t": time.time() - 3700})
+h = StreamCameraHealer(); h._scan_554 = lambda ctx: []
+h.run(ctx)
+check("V4 the same verdict is re-sent after an hour (reminder)", esc_has(rec, "camera-absent"))
+ctx, rec = _camctx(state={"v": "camera-absent", "t": time.time()}, pushing=True)
+h = StreamCameraHealer()
+h.run(ctx); h.run(ctx)
+_ok = [f for c, f in rec["events"] if c == "stream.camera-ok"]
+check("V4 stream pushing again -> stream.camera-ok once, naming the cleared verdict", len(_ok) == 1 and _ok[0].get("was") == "camera-absent")
+ctx, rec = _camctx(pushing=True)
+StreamCameraHealer().run(ctx)
+check("V4 healthy stream with nothing outstanding -> silent", not rec["events"] and not rec["escalate"])
+ctx, rec = mkctx(env={"RTSP_URL": "rtsp://admin:x@192.168.1.99:554/s"}, estab_1935=lambda: 0, rate_ok=lambda n: False)
+h = StreamCameraHealer(); h.run(ctx); h.run(ctx)
+check("V4 repair-rate-exceeded also goes out once, not every tick",
+      [v for _, v in rec["escalate"]].count("stream-repair-rate-exceeded") == 1)
+
+# V5 NAMUR NE43: 3.8-4.0 and 20.0-20.5 are measurements (dry / full scale), <= 3.6 and >= 21.0 are faults
+def _pg(v):
+    return "<html><td>Stromeingang</td><td>%s</td><td>mA</td></html>" % v
+for _v, _want in (("3,799", "ok"), ("3,610", "ok"), ("3,550", "loop-open"), ("3,600", "loop-open"),
+                  ("20,010", "ok"), ("20,900", "ok"), ("21,000", "loop-over"), ("21,700", "loop-over")):
+    h, ctx, rec = _loopctx(_pg(_v))
+    h.run(ctx)
+    _got = (rec["saved"] or {}).get("verdict")
+    check("V5 %s mA -> %s" % (_v, _want), _got == _want)
+
+# V6 manifest + version
+from pat_fleet_healer import events_schema as _SCH3
+from pat_fleet_healer import __version__ as _V
+check("V6 manifest has stream.camera-ok (info)", _SCH3.CODES.get("stream.camera-ok", {}).get("sev") == "info")
+check("V6 manifest loop-over names the NE43 limit", "21.0" in _SCH3.CODES["radar.loop-over"]["desc"])
+check("V6 version 538", _V == "538")
+
 # ---------------------------------------------------------------------------
 for d in _TMP:
     shutil.rmtree(d, ignore_errors=True)
