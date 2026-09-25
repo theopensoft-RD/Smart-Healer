@@ -16,6 +16,7 @@ from .base import Healer
 
 _VS = "stream-verdict"
 REMIND_S = 3600     # an outstanding verdict is re-sent at most hourly (keeps the record's lastSeen honest)
+CONFIRM_TICKS = 2   # a different verdict must hold this many consecutive ticks before it replaces the standing one (v539)
 
 # brand -> CANDIDATE main-stream RTSP paths, most-likely first. These are candidates,
 # never assumptions: each one is probed and the first that actually answers is kept.
@@ -61,6 +62,8 @@ class StreamCameraHealer(Healer):
                 return self._say(ctx, "camera-ambiguous", {"found": found})
             newip = found[0]
             ctx.log("camera %s -> %s (drift/placeholder) + H.264" % (cur_ip, newip))
+            # v539 (E4b): the move itself is news - the record keeps who moved where, not just the repair
+            ctx.event("stream.camera-moved", old=cur_ip, new=newip)
             self._set_codec_h264(ctx, newip, cred)
             self._repoint_cam(ctx, newip)
             cur_ip = newip
@@ -90,7 +93,18 @@ class StreamCameraHealer(Healer):
         st = ctx.state_load(_VS) or {}
         now = time.time()
         if st.get("v") == verdict and now - float(st.get("t", 0)) < REMIND_S:
+            if st.get("pend"):
+                ctx.state_save(_VS, {"v": st["v"], "t": st["t"]})   # the standing verdict is back: drop the candidate
             return None
+        if st.get("v") and st.get("v") != verdict:
+            # v539: a DIFFERENT verdict replaces a standing one only after CONFIRM_TICKS consecutive ticks.
+            # PIT019's camera at .161 answers :554 every other minute, so the healer alternated
+            # camera-absent / camera-path-unknown and the record logged a change each minute (09-25).
+            pend = st.get("pend") or {}
+            n = pend.get("n", 0) + 1 if pend.get("v") == verdict else 1
+            if n < CONFIRM_TICKS:
+                ctx.state_save(_VS, {"v": st["v"], "t": st["t"], "pend": {"v": verdict, "n": n}})
+                return None
         ctx.state_save(_VS, {"v": verdict, "t": now})
         return ctx.escalate(self.name, verdict, ev or {})
 
