@@ -1998,7 +1998,7 @@ check("V4 camera-absent over 3 ticks -> escalated ONCE", [v for _, v in rec["esc
 check("V4 ... and still no restart", len(rec["restart"]) == 0)
 h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
 h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
-check("V4 a DIFFERENT verdict goes out at once, then is quiet too",
+check("V4 a DIFFERENT verdict goes out on its 2nd consecutive tick (v539), then is quiet too",
       [v for _, v in rec["escalate"]] == ["camera-absent", "camera-path-unknown"])
 ctx, rec = _camctx(state={"v": "camera-absent", "t": time.time() - 3700})
 h = StreamCameraHealer(); h._scan_554 = lambda ctx: []
@@ -2032,7 +2032,44 @@ from pat_fleet_healer import events_schema as _SCH3
 from pat_fleet_healer import __version__ as _V
 check("V6 manifest has stream.camera-ok (info)", _SCH3.CODES.get("stream.camera-ok", {}).get("sev") == "info")
 check("V6 manifest loop-over names the NE43 limit", "21.0" in _SCH3.CODES["radar.loop-over"]["desc"])
-check("V6 version 538", _V == "538")
+check("V6 version 538 or later", int(_V) >= 538)
+
+# ===========================================================================
+# v539 (2026-09-25) - a flapping camera does not flap the record; a camera move is an event
+# PIT019's camera at .161 answered :554 every other minute -> camera-absent / camera-path-unknown
+# alternated every tick and the status record logged a "change" each minute (E4b: the move itself).
+# ===========================================================================
+# V7 alternating verdicts while one stands -> nothing new goes out; two consecutive -> it does
+ctx, rec = _camctx(state={"v": "camera-absent", "t": time.time()})
+h = StreamCameraHealer()
+for _v in ("camera-path-unknown", "camera-absent", "camera-path-unknown", "camera-absent", "camera-path-unknown"):
+    h._say(ctx, _v, {"ip": "192.168.1.99"})
+check("V7 absent/path-unknown alternating over 5 ticks -> NO new escalation", rec["escalate"] == [])
+check("V7 ... and the standing verdict stays camera-absent", (rec["saved"] or {}).get("v") == "camera-absent")
+h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
+h._say(ctx, "camera-path-unknown", {"ip": "192.168.1.99"})
+check("V7 the same new verdict on 2 consecutive ticks -> replaces it once",
+      [v for _, v in rec["escalate"]] == ["camera-path-unknown"] and (rec["saved"] or {}).get("v") == "camera-path-unknown")
+check("V7 no candidate left behind in the state", "pend" not in (rec["saved"] or {}))
+# V7b the first verdict with nothing standing still goes out at once (not delayed by the confirm)
+ctx, rec = _camctx()
+h = StreamCameraHealer(); h._scan_554 = lambda ctx: []
+h.run(ctx)
+check("V7 first verdict with nothing standing -> escalated on the first tick", [v for _, v in rec["escalate"]] == ["camera-absent"])
+# V7c a camera found at a NEW address -> stream.camera-moved {old, new} + repoint + restart
+ctx, rec = _camctx()
+h = StreamCameraHealer(); h._scan_554 = lambda ctx: ["192.168.1.77"]
+h._set_codec_h264 = lambda ctx, ip, cred: None
+h._repoint_cam = lambda ctx, ip: rec["repoint"].append(ip)
+h._rtsp_ok = lambda ctx, url: True
+h.run(ctx)
+_mv = [f for c, f in rec["events"] if c == "stream.camera-moved"]
+check("V7 camera drift .99 -> .77 emits stream.camera-moved once with old/new",
+      len(_mv) == 1 and _mv[0].get("old") == "192.168.1.99" and _mv[0].get("new") == "192.168.1.77")
+check("V7 ... and repoints + restarts the stream", rec["repoint"] == ["192.168.1.77"] and len(rec["restart"]) == 1)
+from pat_fleet_healer import events_schema as _SCH4
+check("V7 manifest has stream.camera-moved (info)", _SCH4.CODES.get("stream.camera-moved", {}).get("sev") == "info")
+check("V7 version 539", _V == "539")
 
 # ---------------------------------------------------------------------------
 for d in _TMP:

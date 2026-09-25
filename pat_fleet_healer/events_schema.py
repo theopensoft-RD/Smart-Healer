@@ -104,6 +104,8 @@ CODES = {
                       "fix": "identify the camera model, add its RTSP path to CAM_RTSP_PATH, set RTSP_URL"},
     "stream.camera-ambiguous": {"sev": "warn", "desc": "multiple cameras on LAN :554",
                       "cause": "more than one RTSP device", "fix": "human pick correct cam IP from d.found"},
+    "stream.camera-moved":   {"sev": "info", "desc": "the camera answers at a new LAN address; RTSP_URL repointed d.old -> d.new (E4b, v539)",
+                      "cause": "camera re-addressed (DHCP / re-IP'd / swapped at the same place)", "fix": "none if expected; else find out who changed the camera"},
 
     # --- E1 stream socket wedge (v536) ---
     "stream.socket-wedged":  {"sev": "warn", "desc": "RTMP push socket wedged: unit active, AMS reachable, but bytes_acked moved < d.acked_delta B in d.stall_s s (backoff d.backoff, unacked d.unacked) -> the stream unit was restarted",
