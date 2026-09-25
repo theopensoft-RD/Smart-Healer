@@ -30,6 +30,7 @@ BROKER FACTS - historical (public NAT, measured pit003 -> mqtt.pattaya-smart-san
 
 This module MUST NOT raise: its caller is an event emitter, not a transport.
 """
+import os
 import socket
 import ssl
 import struct
@@ -94,6 +95,14 @@ def publish(host, port, topic, payload, client_id, keepalive=10, timeout=5.0,
     plaintext on TLS failure: silently downgrading would be worse than a failed push,
     and a failed push is already visible as a rising pfail in push.state.
     """
+    # v538: `selftest` (the self-update gate) runs a DRY tick with a throwaway state dir, and it
+    # used to PUBLISH like a real tick: every update's pre/post-install selftest posted a fresh
+    # node.boot under the node's real id, and on the signs (no DEVICE_ID) the selftest's stand-in
+    # identity "SELFTEST" posted as a phantom node that ran the station-only healers against a
+    # controller that is not there (all 21 radar.vegamet-off-network verdicts on 2026-09-24).
+    # This is the ONLY publisher (events, heartbeat, escalations), so one switch covers them all.
+    if os.environ.get("HEALER_NO_PUSH") == "1":
+        return False
     sock = None
     try:
         if isinstance(payload, str):

@@ -29,6 +29,7 @@ def main():
         import os
         import tempfile
         os.environ["HEALER_DRY_RUN"] = "1"
+        os.environ["HEALER_NO_PUSH"] = "1"        # a gate, not a tick: nothing it sees goes to the centre (v538)
         os.environ["HEALER_STATE_DIR"] = tempfile.mkdtemp(prefix="healer-selftest-")
         os.environ.setdefault("HEALER_ENV_PATH", os.path.expanduser("~/.config/pat-smart/.env"))
         from .config import Config
