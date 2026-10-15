@@ -8,6 +8,13 @@ def svc_active(s):
     return sh("systemctl is-active %s" % s)[1] == "active"
 
 
+def svc_enabled(s):
+    """True when the unit is meant to run on this node (`systemctl is-enabled` = enabled). A disabled unit is off on
+    purpose - the radar worker of a flow-only node (MODE=DROPLER), the stream worker of a node without a camera, every
+    worker before go-live - so it is not the healer's to start (v540; v539 started them on every node)."""
+    return sh("systemctl is-enabled %s" % s)[1] in ("enabled", "enabled-runtime")
+
+
 def unit_exists(s):
     return bool(sh("systemctl list-unit-files %s.service --no-legend 2>/dev/null" % s)[1])
 
