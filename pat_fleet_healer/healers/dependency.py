@@ -1,5 +1,6 @@
 """F12 - redis (the radar/stream pub-sub bus) down -> L2 restart redis + bounce
-its dependents (their pub/sub dies with redis)."""
+its dependents (their pub/sub dies with redis). v540: only the workers enabled on
+this node - bouncing a disabled one would START it (flow-only node's radar, no-camera stream)."""
 import time
 from .base import Healer
 
@@ -17,7 +18,8 @@ class DependencyHealer(Healer):
         ctx.rate_hit(self.name)
         if ctx.restart("redis-server"):
             time.sleep(3)
-            for dep in ("pat-smart-radar", "pat-smart-stream"):
-                ctx.restart(dep)
+            for dep in ("pat-smart-radar", "pat-smart-dropler", "pat-smart-stream"):
+                if ctx.svc_enabled(dep):
+                    ctx.restart(dep)
         else:
             ctx.escalate(self.name, "redis-restart-failed")

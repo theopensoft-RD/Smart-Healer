@@ -38,6 +38,7 @@ def production_context(cfg):
     return Context(cfg, {
         "sh":            shell.sh,
         "svc_active":    systemd.svc_active,
+        "svc_enabled":   systemd.svc_enabled,
         "unit_exists":   systemd.unit_exists,
         "svc_age":       systemd.svc_age,
         "restart":       lambda svc: systemd.restart(cfg, svc),

@@ -55,6 +55,7 @@ def mkctx(state=None, env=None, **over):
         "sh":            lambda c, timeout=15: (0, "", ""),
         "log":           lambda m: rec["log"].append(m),
         "svc_active":    lambda s: True,
+        "svc_enabled":   lambda s: True,
         "unit_exists":   lambda s: True,
         "svc_age":       lambda s: 999,
         "restart":       lambda s: (rec["restart"].append(s) or True),
@@ -896,7 +897,9 @@ NetProbeHealer().run(ctx)
 r = [x for x in probe_rows(ctx) if x["k"] == "s"][0]
 check("P19 uptime recorded", r["up"] is None or (isinstance(r["up"], int) and r["up"] > 0))
 import pat_fleet_healer.healers.net_probe as _np
-_uf = tempfile.mkstemp()[1]; open(_uf, "w").write("7289753.12 1234.5\n")
+_ufd, _uf = tempfile.mkstemp(); os.close(_ufd)   # close mkstemp's fd: Windows cannot unlink an open file
+with open(_uf, "w") as _f:
+    _f.write("7289753.12 1234.5\n")
 _orig_uf = _np.UPTIME_FILE; _np.UPTIME_FILE = _uf
 check("P19 uptime parsed from the real file format", NetProbeHealer()._uptime() == 7289753)
 _np.UPTIME_FILE = os.path.join(_uf, "nope")
@@ -2069,7 +2072,34 @@ check("V7 camera drift .99 -> .77 emits stream.camera-moved once with old/new",
 check("V7 ... and repoints + restarts the stream", rec["repoint"] == ["192.168.1.77"] and len(rec["restart"]) == 1)
 from pat_fleet_healer import events_schema as _SCH4
 check("V7 manifest has stream.camera-moved (info)", _SCH4.CODES.get("stream.camera-moved", {}).get("sev") == "info")
-check("V7 version 539", _V == "539")
+
+# --- v540: heal only the units ENABLED on the node; the flow worker is covered ----------------
+# flow-only node (MODE=DROPLER, no camera): radar + stream disabled and stopped, dropler running
+_FLOW = {"pat-smart-dropler"}
+ctx, rec = mkctx(svc_enabled=lambda s: s in _FLOW, svc_active=lambda s: s in _FLOW, svc_age=lambda s: 999)
+ServiceLivenessHealer().run(ctx)
+check("V8a flow-only node: disabled radar + stream are NOT started", rec["restart"] == [] and rec["escalate"] == [])
+# its flow worker died -> restarted like the others
+ctx, rec = mkctx(svc_enabled=lambda s: s in _FLOW, svc_active=lambda s: False, svc_age=lambda s: 999)
+ServiceLivenessHealer().run(ctx)
+check("V8b dead flow worker (enabled) -> L1 restart", rec["restart"] == ["pat-smart-dropler"])
+# a normal level+camera node keeps v539 behaviour: enabled + dead -> restart
+ctx, rec = mkctx(svc_enabled=lambda s: s != "pat-smart-dropler",
+                 svc_active=lambda s: s != "pat-smart-radar", svc_age=lambda s: 999)
+ServiceLivenessHealer().run(ctx)
+check("V8c level node: dead radar (enabled) -> restart; dropler not enabled -> left alone", rec["restart"] == ["pat-smart-radar"])
+# redis restart bounces only the enabled workers
+ctx, rec = mkctx(svc_enabled=lambda s: s in _FLOW, svc_active=lambda s: s != "redis-server")
+DependencyHealer().run(ctx)
+check("V8d redis restart bounces only enabled workers", rec["restart"] == ["redis-server", "pat-smart-dropler"])
+# no camera (stream disabled): the camera healer does nothing at all
+ctx, rec = mkctx(svc_enabled=lambda s: s != "pat-smart-stream", svc_active=lambda s: False, svc_age=lambda s: 999,
+                 estab_1935=lambda: 0)
+h = StreamCameraHealer(); h._scan_554 = lambda ctx: []
+h.run(ctx)
+check("V8e no camera (stream disabled) -> no repair, no escalation, no event",
+      rec["restart"] == [] and rec["escalate"] == [] and rec["events"] == [])
+check("V8 version 540", _V == "540")
 
 # ---------------------------------------------------------------------------
 for d in _TMP:

@@ -33,6 +33,8 @@ class StreamCameraHealer(Healer):
 
     def run(self, ctx):
         svc = "pat-smart-stream"
+        if not ctx.svc_enabled(svc):
+            return                                          # no camera on this node (stream off on purpose), v540
         if ctx.svc_age(svc) < ctx.grace_s and ctx.svc_active(svc):
             return
         # not broken if it is actively pushing -> only enforce STATION_NAME quoting (idempotent)
